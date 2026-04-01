@@ -21,6 +21,8 @@ set(OPENVR_ROOT "${CMAKE_SOURCE_DIR}/third_party/openvr")
 set(OPENVR_INCLUDE_DIR "${OPENVR_ROOT}/headers")
 set(OPENVR_LIBRARY "${OPENVR_ROOT}/lib/win64/openvr_api.lib")
 set(OPENVR_DLL "${OPENVR_ROOT}/bin/win64/openvr_api.dll")
+set(OVERLAY_MANIFEST_TEMPLATE "${CMAKE_SOURCE_DIR}/cmake/steamvr_capture_overlay.vrmanifest.in")
+set(OVERLAY_MANIFEST_CONFIGURED "${CMAKE_BINARY_DIR}/steamvr_capture_overlay.vrmanifest")
 
 if (NOT EXISTS "${OPENVR_INCLUDE_DIR}/openvr.h")
     message(FATAL_ERROR "OpenVR headers were not found. Expected ${OPENVR_INCLUDE_DIR}/openvr.h")
@@ -95,6 +97,63 @@ if (MINGW)
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "${runtime_dll}"
                     "$<TARGET_FILE_DIR:steamvr_capture_recorder>"
+            )
+        endif ()
+    endforeach ()
+endif ()
+
+file(TO_CMAKE_PATH "${PROJECT_RUNTIME_DIR}/tools/steamvr_capture_overlay.exe" OVERLAY_BINARY_PATH)
+configure_file("${OVERLAY_MANIFEST_TEMPLATE}" "${OVERLAY_MANIFEST_CONFIGURED}" @ONLY)
+
+add_executable(steamvr_capture_overlay
+    src/overlay/main.cpp
+    src/overlay/overlay_app.cpp
+)
+
+target_include_directories(steamvr_capture_overlay
+    PRIVATE
+        "${OPENVR_INCLUDE_DIR}"
+        "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_link_libraries(steamvr_capture_overlay
+    PRIVATE
+        "${OPENVR_LIBRARY}"
+        gdi32
+        user32
+        shell32
+)
+
+target_compile_definitions(steamvr_capture_overlay
+    PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+)
+
+set_target_properties(steamvr_capture_overlay PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_RUNTIME_DIR}/tools"
+)
+
+add_custom_command(
+    TARGET steamvr_capture_overlay
+    POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${OPENVR_DLL}"
+        "$<TARGET_FILE_DIR:steamvr_capture_overlay>/openvr_api.dll"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${OVERLAY_MANIFEST_CONFIGURED}"
+        "$<TARGET_FILE_DIR:steamvr_capture_overlay>/steamvr_capture_overlay.vrmanifest"
+)
+
+if (MINGW)
+    foreach (runtime_dll IN LISTS MINGW_RUNTIME_DLLS)
+        if (EXISTS "${runtime_dll}")
+            add_custom_command(
+                TARGET steamvr_capture_overlay
+                POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${runtime_dll}"
+                    "$<TARGET_FILE_DIR:steamvr_capture_overlay>"
             )
         endif ()
     endforeach ()

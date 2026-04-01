@@ -3,6 +3,15 @@
     "enable": true,
     "session_path": "",
     "loop": true,
-    "playback_speed": 1.0
+    "playback_speed": 1.0,
+    "playback_state": "stopped",
+    "session_generation": 0,
+    "loaded_session_path": "",
+    "loaded_tracker_count": 0,
+    "status_text": "Idle",
+    "last_error": ""
+  },
+  "overlay_steamvr_capture": {
+    "session_root": ""
   }
 }

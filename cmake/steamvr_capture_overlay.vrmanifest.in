@@ -1,0 +1,17 @@
+{
+  "source": "builtin",
+  "applications": [
+    {
+      "app_key": "steamvr_capture.overlay",
+      "launch_type": "binary",
+      "binary_path_windows": "@OVERLAY_BINARY_PATH@",
+      "is_dashboard_overlay": true,
+      "strings": {
+        "en_us": {
+          "name": "SteamVR Capture Replay",
+          "description": "Select replay sessions for steamvr-capture."
+        }
+      }
+    }
+  ]
+}

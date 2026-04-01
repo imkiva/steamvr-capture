@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "openvr_driver.h"
@@ -13,7 +14,7 @@ namespace steamvr_capture::replay
 class ReplayTrackerDevice : public vr::ITrackedDeviceServerDriver
 {
 public:
-    explicit ReplayTrackerDevice(session::TrackerDescriptor descriptor);
+    explicit ReplayTrackerDevice(std::size_t slot_index);
 
     vr::EVRInitError Activate(std::uint32_t object_id) override;
     void EnterStandby() override;
@@ -23,16 +24,21 @@ public:
     void Deactivate() override;
 
     const std::string& serial_number() const;
+    void UpdateDescriptor(const std::optional<session::TrackerDescriptor>& descriptor);
     void UpdateSample(const session::PoseSample& sample);
+    void SetDisconnected();
 
 private:
-    void ApplyTrackerRoleSetting();
-    static vr::DriverPose_t ToDriverPose(const session::PoseSample& sample);
+    void ApplyPropertiesLocked();
+    void ApplyTrackerRoleSettingLocked();
+    static vr::DriverPose_t ToDriverPose(const std::optional<session::PoseSample>& sample);
 
-    session::TrackerDescriptor descriptor_;
+    std::size_t slot_index_ = 0;
+    std::optional<session::TrackerDescriptor> descriptor_;
     std::string serial_number_;
     std::atomic<vr::TrackedDeviceIndex_t> device_index_{vr::k_unTrackedDeviceIndexInvalid};
+    vr::PropertyContainerHandle_t property_container_{vr::k_ulInvalidPropertyContainer};
     std::mutex pose_mutex_;
-    session::PoseSample current_sample_;
+    std::optional<session::PoseSample> current_sample_;
 };
 }  // namespace steamvr_capture::replay

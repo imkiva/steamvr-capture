@@ -11,11 +11,18 @@ Bootstrap workspace for recording HTC Vive Tracker 3.0 motion from SteamVR and r
 
 - `driver_steamvr_capture_replay`
   - SteamVR OpenVR driver.
-  - Loads a recorded session file from SteamVR settings.
+  - Polls replay control state from SteamVR settings.
   - Exposes virtual `GenericTracker` devices and feeds replay poses into SteamVR.
 
 - `steamvr_capture_session`
   - Shared file format and parser/writer library.
+
+- `steamvr_capture_overlay`
+  - SteamVR dashboard overlay application.
+  - Lets you browse `.svrcap` files in VR, set a session root, paste a copied Explorer path, or enter a direct path.
+  - Writes replay selection into SteamVR settings so the replay driver hot-reloads the chosen session.
+  - Mirrors the same UI into a desktop window with mouse input, `Ctrl+V`, and Explorer drag-drop.
+  - Exposes explicit replay transport controls: `Play`, `Pause`, `Stop`, and `Loop`.
 
 ## Current Session Format
 
@@ -38,6 +45,7 @@ cmake --build build
 Outputs:
 
 - Recorder: `build/runtime/tools/steamvr_capture_recorder.exe`
+- Overlay: `build/runtime/tools/steamvr_capture_overlay.exe`
 - Driver package root: `build/runtime/steamvr_capture_replay`
 
 ## Recorder Usage
@@ -74,16 +82,23 @@ Register the replay driver package with SteamVR:
 & "$env:ProgramFiles(x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "$PWD\build\runtime\steamvr_capture_replay"
 ```
 
-Then set the session path in SteamVR settings under the `driver_steamvr_capture_replay` section. The default settings file that ships with the driver contains:
+Install the dashboard overlay manifest once:
+
+```powershell
+build/runtime/tools/steamvr_capture_overlay.exe --install-manifest
+```
+
+After that, restart SteamVR. You should see a `SteamVR Capture Replay` dashboard tab. Use it to choose a session file in VR. The overlay updates these SteamVR settings for the driver:
 
 - `enable`
 - `session_path`
 - `loop`
 - `playback_speed`
+- `session_generation`
 
 ## Known Gaps
 
-- No desktop UI yet.
+- Overlay uses a simple in-process GDI UI; there is no desktop companion app yet.
 - Replay currently uses nearest-sample playback, not interpolation.
 - Recorder currently snapshots trackers that are present at capture start and does not remap reconnections by serial mid-session.
 - No automatic startup orchestration yet.

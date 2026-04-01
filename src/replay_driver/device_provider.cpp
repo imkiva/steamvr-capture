@@ -1,18 +1,36 @@
 #include "replay_driver/device_provider.h"
 
 #include <cmath>
+#include <string>
 
 #include "replay_driver/driver_log.h"
+#include "session/replay_settings.h"
 
 namespace steamvr_capture::replay
 {
 namespace
 {
-constexpr const char* kSettingsSection = "driver_steamvr_capture_replay";
-constexpr const char* kEnableKey = "enable";
-constexpr const char* kSessionPathKey = "session_path";
-constexpr const char* kLoopKey = "loop";
-constexpr const char* kPlaybackSpeedKey = "playback_speed";
+std::string ReadSettingsString(const char* section, const char* key)
+{
+    char buffer[4096] = {};
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->GetString(section, key, buffer, sizeof(buffer), &error);
+    return error == vr::VRSettingsError_None ? std::string(buffer) : std::string();
+}
+
+bool ReadSettingsBool(const char* section, const char* key, const bool fallback)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    const bool value = vr::VRSettings()->GetBool(section, key, &error);
+    return error == vr::VRSettingsError_None ? value : fallback;
+}
+
+double ReadSettingsFloat(const char* section, const char* key, const double fallback)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    const float value = vr::VRSettings()->GetFloat(section, key, &error);
+    return (error == vr::VRSettingsError_None && value > 0.0f) ? static_cast<double>(value) : fallback;
+}
 }  // namespace
 
 vr::EVRInitError DeviceProvider::Init(vr::IVRDriverContext* driver_context)
@@ -20,48 +38,27 @@ vr::EVRInitError DeviceProvider::Init(vr::IVRDriverContext* driver_context)
     VR_INIT_SERVER_DRIVER_CONTEXT(driver_context);
 
     vr::EVRSettingsError settings_error = vr::VRSettingsError_None;
-    const bool enabled = vr::VRSettings()->GetBool(kSettingsSection, kEnableKey, &settings_error);
+    const bool enabled =
+        vr::VRSettings()->GetBool(replay_settings::kDriverSection, replay_settings::kEnableKey, &settings_error);
     if (settings_error == vr::VRSettingsError_None && !enabled)
     {
         DriverLog("Replay driver disabled in SteamVR settings.");
         return vr::VRInitError_None;
     }
 
-    loop_enabled_ = vr::VRSettings()->GetBool(kSettingsSection, kLoopKey, &settings_error);
-    if (settings_error != vr::VRSettingsError_None)
-    {
-        loop_enabled_ = true;
-    }
-
-    playback_speed_ = vr::VRSettings()->GetFloat(kSettingsSection, kPlaybackSpeedKey, &settings_error);
-    if (settings_error != vr::VRSettingsError_None || playback_speed_ <= 0.0)
-    {
-        playback_speed_ = 1.0;
-    }
-
-    if (!LoadConfiguredSession())
-    {
-        DriverLog("Replay driver started without a valid session file.");
-        return vr::VRInitError_None;
-    }
-
-    for (const auto& tracker : session_.trackers)
-    {
-        auto device = std::make_unique<ReplayTrackerDevice>(tracker);
-        if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
-                device->serial_number().c_str(),
-                vr::TrackedDeviceClass_GenericTracker,
-                device.get()))
-        {
-            DriverLog("Failed to register replay tracker %s", device->serial_number().c_str());
-            return vr::VRInitError_Driver_Unknown;
-        }
-
-        tracker_devices_.push_back(std::move(device));
-    }
+    loop_enabled_ = ReadSettingsBool(replay_settings::kDriverSection, replay_settings::kLoopKey, true);
+    playback_speed_ = ReadSettingsFloat(replay_settings::kDriverSection, replay_settings::kPlaybackSpeedKey, 1.0);
+    requested_playback_state_ =
+        ReadSettingsString(replay_settings::kDriverSection, replay_settings::kPlaybackStateKey);
+    playback_state_ = ParsePlaybackState(requested_playback_state_);
 
     playback_started_at_ = std::chrono::steady_clock::now();
-    DriverLog("Replay driver initialized with %zu tracker(s)", tracker_devices_.size());
+    last_control_poll_at_ = playback_started_at_ - std::chrono::seconds(1);
+    WriteRuntimeStatus("Idle", "");
+    WriteLoadedSessionMetadata();
+    WritePlaybackStateSetting();
+    PollControlSettings();
+    DriverLog("Replay driver initialized");
     return vr::VRInitError_None;
 }
 
@@ -72,18 +69,29 @@ const char* const* DeviceProvider::GetInterfaceVersions()
 
 void DeviceProvider::RunFrame()
 {
-    if (tracker_devices_.empty())
-    {
-        return;
-    }
+    PollControlSettings();
 
-    const std::uint64_t playback_timestamp_ns = CurrentPlaybackTimestampNs();
-    for (std::size_t tracker_index = 0; tracker_index < tracker_devices_.size(); ++tracker_index)
+    AdvancePlayback(std::chrono::steady_clock::now());
+
+    if (!session_.trackers.empty())
     {
-        const auto sample = session::SampleAtOrBefore(session_, tracker_index, playback_timestamp_ns);
-        if (sample.has_value())
+        for (std::size_t tracker_index = 0; tracker_index < tracker_devices_.size(); ++tracker_index)
         {
-            tracker_devices_[tracker_index]->UpdateSample(*sample);
+            if (tracker_index >= session_.trackers.size())
+            {
+                tracker_devices_[tracker_index]->SetDisconnected();
+                continue;
+            }
+
+            const auto sample = session::SampleAtOrBefore(session_, tracker_index, playback_timestamp_ns_);
+            if (sample.has_value())
+            {
+                tracker_devices_[tracker_index]->UpdateSample(*sample);
+            }
+            else
+            {
+                tracker_devices_[tracker_index]->SetDisconnected();
+            }
         }
     }
 
@@ -104,59 +112,316 @@ void DeviceProvider::EnterStandby()
 
 void DeviceProvider::LeaveStandby()
 {
-    playback_started_at_ = std::chrono::steady_clock::now();
+    SetPlaybackState(playback_state_, std::chrono::steady_clock::now(), false);
 }
 
 void DeviceProvider::Cleanup()
 {
+    session_ = {};
     tracker_devices_.clear();
+    playback_base_timestamp_ns_ = 0;
+    playback_timestamp_ns_ = 0;
+    playback_state_ = PlaybackState::Stopped;
 }
 
-bool DeviceProvider::LoadConfiguredSession()
+void DeviceProvider::PollControlSettings()
 {
-    char session_path[4096] = {};
-    vr::EVRSettingsError error = vr::VRSettingsError_None;
-    vr::VRSettings()->GetString(kSettingsSection, kSessionPathKey, session_path, sizeof(session_path), &error);
-    if (error != vr::VRSettingsError_None || session_path[0] == '\0')
+    const auto now = std::chrono::steady_clock::now();
+    if ((now - last_control_poll_at_) < std::chrono::milliseconds(250))
     {
-        DriverLog("No session_path configured under %s", kSettingsSection);
-        return false;
+        return;
+    }
+    last_control_poll_at_ = now;
+
+    const double requested_playback_speed =
+        ReadSettingsFloat(replay_settings::kDriverSection, replay_settings::kPlaybackSpeedKey, 1.0);
+    if (std::abs(requested_playback_speed - playback_speed_) > 0.0001)
+    {
+        AdvancePlayback(now);
+        playback_speed_ = requested_playback_speed;
+        playback_base_timestamp_ns_ = playback_timestamp_ns_;
+        playback_started_at_ = now;
     }
 
+    loop_enabled_ = ReadSettingsBool(replay_settings::kDriverSection, replay_settings::kLoopKey, true);
+
+    const std::string requested_session_path =
+        ReadSettingsString(replay_settings::kDriverSection, replay_settings::kSessionPathKey);
+    vr::EVRSettingsError settings_error = vr::VRSettingsError_None;
+    const std::int32_t requested_generation = vr::VRSettings()->GetInt32(
+        replay_settings::kDriverSection, replay_settings::kSessionGenerationKey, &settings_error);
+    const std::int32_t effective_generation =
+        settings_error == vr::VRSettingsError_None ? requested_generation : 0;
+    const std::string requested_playback_state =
+        ReadSettingsString(replay_settings::kDriverSection, replay_settings::kPlaybackStateKey);
+
+    const bool session_changed =
+        requested_session_path != requested_session_path_ || effective_generation != current_generation_;
+    const bool playback_state_changed = requested_playback_state != requested_playback_state_;
+
+    if (!session_changed && !playback_state_changed)
+    {
+        return;
+    }
+
+    if (session_changed)
+    {
+        requested_session_path_ = requested_session_path;
+        ApplyRequestedSession(requested_session_path, effective_generation);
+        return;
+    }
+
+    if (playback_state_changed)
+    {
+        requested_playback_state_ = requested_playback_state;
+        SetPlaybackState(ParsePlaybackState(requested_playback_state), now, false);
+    }
+}
+
+bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, const std::int32_t generation)
+{
+    current_generation_ = generation;
+    playback_base_timestamp_ns_ = 0;
+    playback_timestamp_ns_ = 0;
+    playback_started_at_ = std::chrono::steady_clock::now();
+
+    if (session_path.empty())
+    {
+        session_ = {};
+        loaded_session_path_.clear();
+        playback_state_ = PlaybackState::Stopped;
+        requested_playback_state_ = PlaybackStateToString(playback_state_);
+        for (auto& tracker_device : tracker_devices_)
+        {
+            tracker_device->UpdateDescriptor(std::nullopt);
+            tracker_device->SetDisconnected();
+        }
+        WriteRuntimeStatus("Idle", "");
+        WriteLoadedSessionMetadata();
+        WritePlaybackStateSetting();
+        return true;
+    }
+
+    session::SessionData loaded_session;
     std::string parse_error;
-    if (!session::LoadSessionFile(session_path, &session_, &parse_error))
+    if (!session::LoadSessionFile(session_path, &loaded_session, &parse_error))
     {
-        DriverLog("Failed to load session file %s: %s", session_path, parse_error.c_str());
+        WriteRuntimeStatus("Failed to load session", parse_error);
+        playback_state_ = PlaybackState::Stopped;
+        WritePlaybackStateSetting();
+        DriverLog("Failed to load session file %s: %s", session_path.c_str(), parse_error.c_str());
         return false;
     }
 
-    if (session_.trackers.empty())
+    if (loaded_session.trackers.empty())
     {
-        DriverLog("Configured session file contains no trackers.");
+        const std::string error = "Selected session contains no trackers.";
+        WriteRuntimeStatus("Failed to load session", error);
+        playback_state_ = PlaybackState::Stopped;
+        WritePlaybackStateSetting();
+        DriverLog("%s", error.c_str());
         return false;
     }
 
+    EnsureTrackerCapacity(loaded_session.trackers.size());
+
+    session_ = std::move(loaded_session);
+    loaded_session_path_ = session_path;
+    playback_state_ = PlaybackState::Stopped;
+    requested_playback_state_ = PlaybackStateToString(playback_state_);
+
+    for (std::size_t index = 0; index < tracker_devices_.size(); ++index)
+    {
+        if (index < session_.trackers.size())
+        {
+            tracker_devices_[index]->UpdateDescriptor(session_.trackers[index]);
+        }
+        else
+        {
+            tracker_devices_[index]->UpdateDescriptor(std::nullopt);
+        }
+        tracker_devices_[index]->SetDisconnected();
+    }
+
+    WriteRuntimeStatus("Loaded session", "");
+    WriteLoadedSessionMetadata();
+    WritePlaybackStateSetting();
+    DriverLog("Loaded session %s with %zu tracker(s)", session_path.c_str(), session_.trackers.size());
     return true;
 }
 
-std::uint64_t DeviceProvider::CurrentPlaybackTimestampNs() const
+void DeviceProvider::EnsureTrackerCapacity(const std::size_t required_count)
+{
+    while (tracker_devices_.size() < required_count)
+    {
+        auto tracker_device = std::make_unique<ReplayTrackerDevice>(tracker_devices_.size());
+        if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
+                tracker_device->serial_number().c_str(),
+                vr::TrackedDeviceClass_GenericTracker,
+                tracker_device.get()))
+        {
+            DriverLog("Failed to register replay tracker %s", tracker_device->serial_number().c_str());
+            return;
+        }
+        tracker_devices_.push_back(std::move(tracker_device));
+    }
+}
+
+void DeviceProvider::SetPlaybackState(
+    const PlaybackState next_state,
+    const std::chrono::steady_clock::time_point now,
+    const bool update_settings)
+{
+    if (session_.trackers.empty() && next_state != PlaybackState::Stopped)
+    {
+        playback_state_ = PlaybackState::Stopped;
+        requested_playback_state_ = PlaybackStateToString(playback_state_);
+        WriteRuntimeStatus("Idle", "No session is loaded.");
+        WritePlaybackStateSetting();
+        return;
+    }
+
+    AdvancePlayback(now);
+    playback_state_ = next_state;
+
+    switch (playback_state_)
+    {
+    case PlaybackState::Playing:
+        playback_base_timestamp_ns_ = playback_timestamp_ns_;
+        playback_started_at_ = now;
+        WriteRuntimeStatus("Playing", "");
+        break;
+
+    case PlaybackState::Paused:
+        WriteRuntimeStatus("Paused", "");
+        break;
+
+    case PlaybackState::Stopped:
+    default:
+        playback_base_timestamp_ns_ = 0;
+        playback_timestamp_ns_ = 0;
+        playback_started_at_ = now;
+        WriteRuntimeStatus(session_.trackers.empty() ? "Idle" : "Stopped", "");
+        break;
+    }
+
+    if (update_settings)
+    {
+        WritePlaybackStateSetting();
+    }
+}
+
+void DeviceProvider::AdvancePlayback(const std::chrono::steady_clock::time_point now)
 {
     if (session_.duration_ns == 0)
     {
-        return 0;
+        playback_timestamp_ns_ = 0;
+        return;
     }
 
-    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - playback_started_at_)
-                                .count();
-    const auto scaled =
+    switch (playback_state_)
+    {
+    case PlaybackState::Stopped:
+        playback_timestamp_ns_ = 0;
+        return;
+
+    case PlaybackState::Paused:
+        return;
+
+    case PlaybackState::Playing:
+    default:
+        break;
+    }
+
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - playback_started_at_).count();
+    const auto advanced_ns =
+        playback_base_timestamp_ns_ +
         static_cast<std::uint64_t>(std::llround(static_cast<long double>(elapsed_ns) * playback_speed_));
 
     if (loop_enabled_)
     {
-        return scaled % session_.duration_ns;
+        playback_timestamp_ns_ = advanced_ns % session_.duration_ns;
+        return;
     }
 
-    return scaled > session_.duration_ns ? session_.duration_ns : scaled;
+    if (advanced_ns >= session_.duration_ns)
+    {
+        playback_state_ = PlaybackState::Stopped;
+        requested_playback_state_ = PlaybackStateToString(playback_state_);
+        playback_base_timestamp_ns_ = 0;
+        playback_timestamp_ns_ = 0;
+        playback_started_at_ = now;
+        WriteRuntimeStatus("Stopped", "");
+        WritePlaybackStateSetting();
+        return;
+    }
+
+    playback_timestamp_ns_ = advanced_ns;
+}
+
+void DeviceProvider::WriteRuntimeStatus(const std::string& status_text, const std::string& last_error)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->SetString(
+        replay_settings::kDriverSection, replay_settings::kStatusTextKey, status_text.c_str(), &error);
+    vr::VRSettings()->SetString(
+        replay_settings::kDriverSection, replay_settings::kLastErrorKey, last_error.c_str(), &error);
+}
+
+void DeviceProvider::WriteLoadedSessionMetadata()
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->SetString(
+        replay_settings::kDriverSection,
+        replay_settings::kLoadedSessionPathKey,
+        loaded_session_path_.c_str(),
+        &error);
+    vr::VRSettings()->SetInt32(
+        replay_settings::kDriverSection,
+        replay_settings::kLoadedTrackerCountKey,
+        static_cast<std::int32_t>(session_.trackers.size()),
+        &error);
+}
+
+void DeviceProvider::WritePlaybackStateSetting()
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->SetString(
+        replay_settings::kDriverSection,
+        replay_settings::kPlaybackStateKey,
+        PlaybackStateToString(playback_state_),
+        &error);
+}
+
+DeviceProvider::PlaybackState DeviceProvider::ParsePlaybackState(const std::string& value)
+{
+    if (value == "playing")
+    {
+        return PlaybackState::Playing;
+    }
+
+    if (value == "paused")
+    {
+        return PlaybackState::Paused;
+    }
+
+    return PlaybackState::Stopped;
+}
+
+const char* DeviceProvider::PlaybackStateToString(const PlaybackState value)
+{
+    switch (value)
+    {
+    case PlaybackState::Playing:
+        return "playing";
+
+    case PlaybackState::Paused:
+        return "paused";
+
+    case PlaybackState::Stopped:
+    default:
+        return "stopped";
+    }
 }
 }  // namespace steamvr_capture::replay

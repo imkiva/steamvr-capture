@@ -31,14 +31,17 @@ The project is intentionally split into two OpenVR layers:
    - Defines tracker descriptors, pose samples, file parsing, and file writing.
    - Safe to link into both the recorder and the driver because it does not include either `openvr.h` or `openvr_driver.h`.
 
-4. `desktop-ui`
-   - Not implemented yet.
-   - Will later supervise capture/replay, session management, and tracker-role mapping.
+4. `steamvr-dashboard-overlay`
+   - OpenVR overlay application layer (`openvr.h`)
+   - Creates a SteamVR dashboard tab for replay control.
+   - Browses `.svrcap` session files and accepts direct path entry through the SteamVR keyboard.
+   - Writes replay control state into `vrsettings` so the replay driver can hot-reload the selected session without hard-coded config edits.
 
 ## Constraints
 
 - Do not mix `openvr.h` and `openvr_driver.h` inside the same binary.
 - Recorder and replay driver must remain separate binaries.
+- Overlay must remain a separate OpenVR application binary and must not link against `openvr_driver.h`.
 - Recorder uses `TrackingUniverseStanding` and stores sampled, non-predicted poses.
 - Session files must include serial number, tracking system name, model number, and tracker role metadata.
 - Replay driver must expose unique virtual serial numbers and must not impersonate real HTC tracker serial numbers.
@@ -49,13 +52,14 @@ The project is intentionally split into two OpenVR layers:
 - CMake workspace with vendored OpenVR SDK under `third_party/openvr`.
 - Text-based session format for bootstrapping end-to-end flow quickly.
 - CLI recorder that can list trackers and record for a fixed duration.
-- SteamVR replay driver that loads a configured session file and exposes virtual trackers.
-- No desktop UI, live passthrough, interpolation, compression, or editing tools yet.
+- SteamVR replay driver that hot-reloads the selected session file and exposes virtual trackers.
+- SteamVR dashboard overlay for choosing a session root or direct replay file path inside VR.
+- No live passthrough, interpolation, compression, or editing tools yet.
 
 ## Near-Term Roadmap
 
 1. Replace the bootstrap text session format with a binary or chunked format once the data path is stable.
 2. Add interpolation for smoother replay between recorded samples.
-3. Add a control channel between UI and replay driver for transport controls.
+3. Extend the overlay-to-driver control channel beyond session selection to cover transport controls.
 4. Add auto-launch behavior and tray integration after the base data path is reliable.
 5. Add tests for file parsing and pose conversion helpers.
