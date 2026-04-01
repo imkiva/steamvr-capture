@@ -5,6 +5,8 @@
 #include <cwchar>
 #include <thread>
 
+#include "hotpatch/server_driver_hook.h"
+
 namespace steamvr_capture::hotpatch
 {
 namespace
@@ -25,12 +27,17 @@ void CopyWideText(wchar_t (&destination)[N], const wchar_t* value)
 }  // namespace
 
 HotpatchRuntime::HotpatchRuntime(HMODULE module_handle)
-    : module_handle_(module_handle)
+    : module_handle_(module_handle),
+      server_driver_hook_(std::make_unique<ServerDriverHook>())
 {
 }
 
 HotpatchRuntime::~HotpatchRuntime()
 {
+    if (server_driver_hook_ != nullptr)
+    {
+        server_driver_hook_->Uninstall();
+    }
     CloseSharedState();
 }
 
@@ -47,17 +54,33 @@ void HotpatchRuntime::Run()
         shared_state_->injected_pid = GetCurrentProcessId();
         shared_state_->injected_heartbeat_ms = GetHeartbeatMilliseconds();
 
-        if (IsLighthouseModuleLoaded())
+        if (!IsReplayDriverLoaded())
         {
             PublishStatus(
-                L"Injected into vrserver. driver_lighthouse.dll is loaded. Hook installation is not implemented yet in this iteration.",
-                HookState::LighthouseLoaded);
+                L"Injected into vrserver. Waiting for driver_steamvr_capture_replay.dll to load before resolving the hook bridge.",
+                HookState::Injected);
         }
-        else
+        else if (!IsLighthouseModuleLoaded())
         {
             PublishStatus(
                 L"Injected into vrserver. Waiting for driver_lighthouse.dll to appear before installing hooks.",
                 HookState::Injected);
+        }
+        else
+        {
+            std::wstring hook_status;
+            if (server_driver_hook_ != nullptr && server_driver_hook_->EnsureInstalled(shared_state_, &hook_status))
+            {
+                PublishStatus(hook_status.c_str(), HookState::HookInstalled);
+            }
+            else
+            {
+                PublishStatus(
+                    hook_status.empty()
+                        ? L"Injected into vrserver, but the live hook is not ready yet."
+                        : hook_status.c_str(),
+                    HookState::LighthouseLoaded);
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -130,6 +153,11 @@ void HotpatchRuntime::PublishStatus(const wchar_t* text, const HookState hook_st
 bool HotpatchRuntime::IsLighthouseModuleLoaded() const
 {
     return GetModuleHandleW(L"driver_lighthouse.dll") != nullptr;
+}
+
+bool HotpatchRuntime::IsReplayDriverLoaded() const
+{
+    return GetModuleHandleW(L"driver_steamvr_capture_replay.dll") != nullptr;
 }
 
 std::uint64_t HotpatchRuntime::GetHeartbeatMilliseconds()

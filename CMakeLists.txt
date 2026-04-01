@@ -105,10 +105,12 @@ endif ()
 add_library(steamvr_capture_hotpatch SHARED
     src/hotpatch/dllmain.cpp
     src/hotpatch/hotpatch_runtime.cpp
+    src/hotpatch/server_driver_hook.cpp
 )
 
 target_include_directories(steamvr_capture_hotpatch
     PRIVATE
+        "${OPENVR_INCLUDE_DIR}"
         "${CMAKE_SOURCE_DIR}/src"
 )
 
@@ -249,6 +251,7 @@ endif ()
 add_library(driver_steamvr_capture_replay SHARED
     src/replay_driver/hmd_driver_factory.cpp
     src/replay_driver/device_provider.cpp
+    src/replay_driver/hotpatch_bridge_exports.cpp
     src/replay_driver/replay_tracker_device.cpp
     src/replay_driver/driver_log.cpp
 )

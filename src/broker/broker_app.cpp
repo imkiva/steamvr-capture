@@ -216,6 +216,9 @@ int BrokerApp::PrintStatus()
     std::printf("suppress_real_trackers=%u\n", shared_state_->suppress_real_trackers);
     std::printf("mode=%u\n", shared_state_->live_mode);
     std::printf("hook_state=%u\n", static_cast<unsigned>(hook_state));
+    std::printf("tracked_device_add_calls=%u\n", shared_state_->tracked_device_add_calls);
+    std::printf("pose_updates_seen=%u\n", shared_state_->pose_updates_seen);
+    std::printf("pose_updates_suppressed=%u\n", shared_state_->pose_updates_suppressed);
     std::printf("session=%s\n", WideToUtf8(shared_state_->session_path).c_str());
     std::printf("broker_status=%s\n", WideToUtf8(shared_state_->broker_status_text).c_str());
     std::printf("dll_status=%s\n", WideToUtf8(shared_state_->dll_status_text).c_str());

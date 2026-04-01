@@ -48,6 +48,9 @@ struct SharedState
     std::uint32_t live_mode = static_cast<std::uint32_t>(LiveMode::Passthrough);
     std::uint32_t serial_count = 0u;
     std::uint32_t hook_state = static_cast<std::uint32_t>(HookState::Inactive);
+    std::uint32_t tracked_device_add_calls = 0u;
+    std::uint32_t pose_updates_seen = 0u;
+    std::uint32_t pose_updates_suppressed = 0u;
     std::uint64_t broker_heartbeat_ms = 0u;
     std::uint64_t injected_heartbeat_ms = 0u;
     wchar_t session_path[kMaxWidePathCharacters]{};
