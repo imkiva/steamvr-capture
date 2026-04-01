@@ -66,6 +66,17 @@ void HotpatchRuntime::Run()
                 L"Injected into vrserver. Waiting for driver_lighthouse.dll to appear before installing hooks.",
                 HookState::Injected);
         }
+        else if (shared_state_->playback_active == 0u ||
+            static_cast<LiveMode>(shared_state_->live_mode) == LiveMode::Passthrough)
+        {
+            if (server_driver_hook_ != nullptr && server_driver_hook_->installed())
+            {
+                server_driver_hook_->Uninstall();
+            }
+            PublishStatus(
+                L"Injected into vrserver. Live hook is idle until replay starts.",
+                HookState::LighthouseLoaded);
+        }
         else
         {
             std::wstring hook_status;

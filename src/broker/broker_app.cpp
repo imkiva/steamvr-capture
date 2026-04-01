@@ -234,7 +234,7 @@ int BrokerApp::Run(const bool once)
             PollReplayState();
             AdvancePlayback(now);
             UpdateSharedState();
-            const bool should_inject = !session_path_.empty() && live_mode_ != hotpatch::LiveMode::Passthrough;
+            const bool should_inject = playback_active_ && live_mode_ != hotpatch::LiveMode::Passthrough;
             if (should_inject)
             {
                 std::string inject_error;

@@ -71,7 +71,7 @@ private:
     bool TryGetDeviceMetadata(vr::TrackedDeviceIndex_t device_index, DeviceMetadata* metadata);
     bool ResolveTargetDevice(vr::TrackedDeviceIndex_t device_index, LiveMode* live_mode, std::uint32_t* slot_index);
     vr::DriverPose_t BuildDisconnectedPose() const;
-    vr::DriverPose_t BuildDriverPose(const LivePoseSlot& live_pose) const;
+    vr::DriverPose_t BuildReplacedPose(const LivePoseSlot& live_pose, const vr::DriverPose_t& reference_pose) const;
 
     bool HandleTrackedDeviceAdded(
         vr::IVRServerDriverHost* self,

@@ -1,6 +1,8 @@
 #include "hotpatch/server_driver_hook.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstring>
 
 namespace steamvr_capture::hotpatch
@@ -8,6 +10,7 @@ namespace steamvr_capture::hotpatch
 namespace
 {
 ServerDriverHook* g_server_driver_hook = nullptr;
+constexpr double kQuaternionEpsilon = 1e-9;
 
 std::wstring Utf8ToWide(const std::string& text)
 {
@@ -25,6 +28,56 @@ std::wstring Utf8ToWide(const std::string& text)
     std::wstring result(static_cast<std::size_t>(required - 1), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, result.data(), required);
     return result;
+}
+
+vr::HmdQuaternion_t NormalizeQuaternion(vr::HmdQuaternion_t quaternion)
+{
+    const double length = std::sqrt(
+        quaternion.w * quaternion.w +
+        quaternion.x * quaternion.x +
+        quaternion.y * quaternion.y +
+        quaternion.z * quaternion.z);
+    if (length <= kQuaternionEpsilon)
+    {
+        return {1.0, 0.0, 0.0, 0.0};
+    }
+
+    quaternion.w /= length;
+    quaternion.x /= length;
+    quaternion.y /= length;
+    quaternion.z /= length;
+    return quaternion;
+}
+
+vr::HmdQuaternion_t ConjugateQuaternion(const vr::HmdQuaternion_t quaternion)
+{
+    return {quaternion.w, -quaternion.x, -quaternion.y, -quaternion.z};
+}
+
+vr::HmdQuaternion_t MultiplyQuaternion(const vr::HmdQuaternion_t lhs, const vr::HmdQuaternion_t rhs)
+{
+    return {
+        (lhs.w * rhs.w) - (lhs.x * rhs.x) - (lhs.y * rhs.y) - (lhs.z * rhs.z),
+        (lhs.w * rhs.x) + (lhs.x * rhs.w) + (lhs.y * rhs.z) - (lhs.z * rhs.y),
+        (lhs.w * rhs.y) + (lhs.y * rhs.w) + (lhs.z * rhs.x) - (lhs.x * rhs.z),
+        (lhs.w * rhs.z) + (lhs.z * rhs.w) + (lhs.x * rhs.y) - (lhs.y * rhs.x)};
+}
+
+std::array<double, 3> RotateVector(
+    const vr::HmdQuaternion_t rotation,
+    const std::array<double, 3>& vector)
+{
+    const vr::HmdQuaternion_t normalized_rotation = NormalizeQuaternion(rotation);
+    const vr::HmdQuaternion_t vector_quaternion{0.0, vector[0], vector[1], vector[2]};
+    const vr::HmdQuaternion_t rotated = MultiplyQuaternion(
+        MultiplyQuaternion(normalized_rotation, vector_quaternion),
+        ConjugateQuaternion(normalized_rotation));
+    return {rotated.x, rotated.y, rotated.z};
+}
+
+std::array<double, 3> SubtractVectors(const std::array<double, 3>& lhs, const double rhs[3])
+{
+    return {lhs[0] - rhs[0], lhs[1] - rhs[1], lhs[2] - rhs[2]};
 }
 }  // namespace
 
@@ -313,30 +366,66 @@ vr::DriverPose_t ServerDriverHook::BuildDisconnectedPose() const
     return pose;
 }
 
-vr::DriverPose_t ServerDriverHook::BuildDriverPose(const LivePoseSlot& live_pose) const
+vr::DriverPose_t ServerDriverHook::BuildReplacedPose(
+    const LivePoseSlot& live_pose, const vr::DriverPose_t& reference_pose) const
 {
     if (live_pose.sample_present == 0u)
     {
         return BuildDisconnectedPose();
     }
 
-    vr::DriverPose_t pose{};
+    vr::DriverPose_t pose = reference_pose;
     pose.poseTimeOffset = 0.0;
-    pose.qWorldFromDriverRotation.w = 1.0;
-    pose.qDriverFromHeadRotation.w = 1.0;
-    pose.qRotation.w = live_pose.rotation_wxyz[0];
-    pose.qRotation.x = live_pose.rotation_wxyz[1];
-    pose.qRotation.y = live_pose.rotation_wxyz[2];
-    pose.qRotation.z = live_pose.rotation_wxyz[3];
-    pose.vecPosition[0] = live_pose.position_m[0];
-    pose.vecPosition[1] = live_pose.position_m[1];
-    pose.vecPosition[2] = live_pose.position_m[2];
-    pose.vecVelocity[0] = live_pose.linear_velocity_mps[0];
-    pose.vecVelocity[1] = live_pose.linear_velocity_mps[1];
-    pose.vecVelocity[2] = live_pose.linear_velocity_mps[2];
-    pose.vecAngularVelocity[0] = live_pose.angular_velocity_rps[0];
-    pose.vecAngularVelocity[1] = live_pose.angular_velocity_rps[1];
-    pose.vecAngularVelocity[2] = live_pose.angular_velocity_rps[2];
+    pose.qWorldFromDriverRotation = NormalizeQuaternion(reference_pose.qWorldFromDriverRotation);
+    if (std::abs(pose.qWorldFromDriverRotation.w) <= kQuaternionEpsilon &&
+        std::abs(pose.qWorldFromDriverRotation.x) <= kQuaternionEpsilon &&
+        std::abs(pose.qWorldFromDriverRotation.y) <= kQuaternionEpsilon &&
+        std::abs(pose.qWorldFromDriverRotation.z) <= kQuaternionEpsilon)
+    {
+        pose.qWorldFromDriverRotation = {1.0, 0.0, 0.0, 0.0};
+    }
+    pose.qDriverFromHeadRotation = NormalizeQuaternion(reference_pose.qDriverFromHeadRotation);
+    if (std::abs(pose.qDriverFromHeadRotation.w) <= kQuaternionEpsilon &&
+        std::abs(pose.qDriverFromHeadRotation.x) <= kQuaternionEpsilon &&
+        std::abs(pose.qDriverFromHeadRotation.y) <= kQuaternionEpsilon &&
+        std::abs(pose.qDriverFromHeadRotation.z) <= kQuaternionEpsilon)
+    {
+        pose.qDriverFromHeadRotation = {1.0, 0.0, 0.0, 0.0};
+    }
+
+    const vr::HmdQuaternion_t inverse_world_from_driver = ConjugateQuaternion(pose.qWorldFromDriverRotation);
+    const std::array<double, 3> world_position = {
+        live_pose.position_m[0],
+        live_pose.position_m[1],
+        live_pose.position_m[2]};
+    const std::array<double, 3> translated_position =
+        SubtractVectors(world_position, pose.vecWorldFromDriverTranslation);
+    const std::array<double, 3> local_position =
+        RotateVector(inverse_world_from_driver, translated_position);
+    const std::array<double, 3> local_velocity = RotateVector(
+        inverse_world_from_driver,
+        {live_pose.linear_velocity_mps[0], live_pose.linear_velocity_mps[1], live_pose.linear_velocity_mps[2]});
+    const std::array<double, 3> local_angular_velocity = RotateVector(
+        inverse_world_from_driver,
+        {live_pose.angular_velocity_rps[0], live_pose.angular_velocity_rps[1], live_pose.angular_velocity_rps[2]});
+    const vr::HmdQuaternion_t world_rotation = NormalizeQuaternion({
+        live_pose.rotation_wxyz[0],
+        live_pose.rotation_wxyz[1],
+        live_pose.rotation_wxyz[2],
+        live_pose.rotation_wxyz[3]});
+    const vr::HmdQuaternion_t local_rotation =
+        NormalizeQuaternion(MultiplyQuaternion(inverse_world_from_driver, world_rotation));
+
+    pose.qRotation = local_rotation;
+    pose.vecPosition[0] = local_position[0];
+    pose.vecPosition[1] = local_position[1];
+    pose.vecPosition[2] = local_position[2];
+    pose.vecVelocity[0] = local_velocity[0];
+    pose.vecVelocity[1] = local_velocity[1];
+    pose.vecVelocity[2] = local_velocity[2];
+    pose.vecAngularVelocity[0] = local_angular_velocity[0];
+    pose.vecAngularVelocity[1] = local_angular_velocity[1];
+    pose.vecAngularVelocity[2] = local_angular_velocity[2];
     pose.poseIsValid = live_pose.pose_valid != 0u;
     pose.deviceIsConnected = live_pose.device_connected != 0u;
     pose.willDriftInYaw = false;
@@ -404,7 +493,8 @@ void ServerDriverHook::HandleTrackedDevicePoseUpdated(
             {
                 ++shared_state_->pose_updates_replaced;
             }
-            const vr::DriverPose_t replacement_pose = BuildDriverPose(shared_state_->live_poses[slot_index]);
+            const vr::DriverPose_t replacement_pose =
+                BuildReplacedPose(shared_state_->live_poses[slot_index], pose);
             original_tracked_device_pose_updated_(self, which_device, replacement_pose, pose_struct_size);
             return;
         }
@@ -510,7 +600,7 @@ vr::DriverPose_t ServerDriverHook::TrackedDeviceProxy::GetPose()
         {
             if (live_mode == LiveMode::Replace)
             {
-                return owner_->BuildDriverPose(owner_->shared_state_->live_poses[slot_index]);
+                return owner_->BuildReplacedPose(owner_->shared_state_->live_poses[slot_index], pose);
             }
             return owner_->BuildDisconnectedPose();
         }
