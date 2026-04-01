@@ -68,8 +68,10 @@ private:
     void PrimeExistingDevices();
     void RecordActivatedDevice(vr::TrackedDeviceIndex_t device_index, const std::string& serial, vr::ETrackedDeviceClass device_class);
     void RemoveDevice(vr::TrackedDeviceIndex_t device_index);
-    bool ShouldSuppressDevice(vr::TrackedDeviceIndex_t device_index) const;
+    bool TryGetDeviceMetadata(vr::TrackedDeviceIndex_t device_index, DeviceMetadata* metadata);
+    bool ResolveTargetDevice(vr::TrackedDeviceIndex_t device_index, LiveMode* live_mode, std::uint32_t* slot_index);
     vr::DriverPose_t BuildDisconnectedPose() const;
+    vr::DriverPose_t BuildDriverPose(const LivePoseSlot& live_pose) const;
 
     bool HandleTrackedDeviceAdded(
         vr::IVRServerDriverHost* self,

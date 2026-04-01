@@ -13,5 +13,9 @@
   },
   "overlay_steamvr_capture": {
     "session_root": ""
+  },
+  "steamvr_capture_hotpatch": {
+    "suppress_real_trackers": true,
+    "live_mode": "suppress"
   }
 }

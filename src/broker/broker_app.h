@@ -3,11 +3,13 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 #include "hotpatch_shared/hotpatch_protocol.h"
+#include "session/session_format.h"
 
 namespace steamvr_capture::broker
 {
@@ -34,6 +36,10 @@ private:
     void ShutdownOpenVr();
     void PollReplayState();
     void LoadSessionTargets();
+    void SetPlaybackState(const std::string& next_state, std::chrono::steady_clock::time_point now);
+    void AdvancePlayback(std::chrono::steady_clock::time_point now);
+    void ClearLivePoseSlots();
+    void UpdateLivePoseSlots();
     void RefreshVrServerTarget();
     void UpdateSharedState();
     bool EnsureInjected(std::string* error);
@@ -52,8 +58,15 @@ private:
     std::uint32_t target_pid_ = 0u;
     bool suppress_real_trackers_ = true;
     bool playback_active_ = false;
+    bool loop_enabled_ = true;
+    double playback_speed_ = 1.0;
+    hotpatch::LiveMode live_mode_ = hotpatch::LiveMode::Suppress;
     std::string playback_state_ = "stopped";
     std::string session_path_;
+    session::SessionData loaded_session_;
     std::vector<std::wstring> target_serials_;
+    std::uint64_t playback_base_timestamp_ns_ = 0u;
+    std::uint64_t playback_timestamp_ns_ = 0u;
+    std::chrono::steady_clock::time_point playback_started_at_{};
 };
 }  // namespace steamvr_capture::broker

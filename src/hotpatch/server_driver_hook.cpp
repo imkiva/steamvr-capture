@@ -208,30 +208,90 @@ void ServerDriverHook::RemoveDevice(const vr::TrackedDeviceIndex_t device_index)
     devices_by_index_.erase(device_index);
 }
 
-bool ServerDriverHook::ShouldSuppressDevice(const vr::TrackedDeviceIndex_t device_index) const
+bool ServerDriverHook::TryGetDeviceMetadata(const vr::TrackedDeviceIndex_t device_index, DeviceMetadata* metadata)
 {
-    if (shared_state_ == nullptr || shared_state_->playback_active == 0u || shared_state_->suppress_real_trackers == 0u)
+    if (metadata == nullptr)
     {
         return false;
     }
 
-    std::lock_guard<std::mutex> guard(mutex_);
-    const auto it = devices_by_index_.find(device_index);
-    if (it == devices_by_index_.end())
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto it = devices_by_index_.find(device_index);
+        if (it != devices_by_index_.end())
+        {
+            *metadata = it->second;
+            return true;
+        }
+    }
+
+    if (get_tracked_device_info_ == nullptr)
     {
         return false;
     }
 
-    if (it->second.device_class != vr::TrackedDeviceClass_GenericTracker)
+    ReplayBridgeTrackedDeviceInfo info{};
+    if (!get_tracked_device_info_(device_index, &info) || info.is_present == 0u || info.serial[0] == '\0')
     {
         return false;
     }
 
-    const std::wstring target_serial = Utf8ToWide(it->second.serial);
+    const DeviceMetadata resolved_metadata{
+        std::string(info.serial),
+        static_cast<vr::ETrackedDeviceClass>(info.device_class)};
+    RecordActivatedDevice(device_index, resolved_metadata.serial, resolved_metadata.device_class);
+    *metadata = resolved_metadata;
+    return true;
+}
+
+bool ServerDriverHook::ResolveTargetDevice(
+    const vr::TrackedDeviceIndex_t device_index, LiveMode* live_mode, std::uint32_t* slot_index)
+{
+    if (live_mode != nullptr)
+    {
+        *live_mode = LiveMode::Passthrough;
+    }
+
+    if (slot_index != nullptr)
+    {
+        *slot_index = 0u;
+    }
+
+    if (shared_state_ == nullptr || shared_state_->playback_active == 0u)
+    {
+        return false;
+    }
+
+    const LiveMode resolved_mode = static_cast<LiveMode>(shared_state_->live_mode);
+    if (resolved_mode == LiveMode::Passthrough)
+    {
+        return false;
+    }
+
+    DeviceMetadata metadata;
+    if (!TryGetDeviceMetadata(device_index, &metadata))
+    {
+        return false;
+    }
+
+    if (metadata.device_class != vr::TrackedDeviceClass_GenericTracker)
+    {
+        return false;
+    }
+
+    const std::wstring target_serial = Utf8ToWide(metadata.serial);
     for (std::uint32_t serial_index = 0; serial_index < shared_state_->serial_count && serial_index < kMaxTrackedSerials; ++serial_index)
     {
         if (_wcsicmp(shared_state_->serials[serial_index].serial, target_serial.c_str()) == 0)
         {
+            if (live_mode != nullptr)
+            {
+                *live_mode = resolved_mode;
+            }
+            if (slot_index != nullptr)
+            {
+                *slot_index = serial_index;
+            }
             return true;
         }
     }
@@ -250,6 +310,38 @@ vr::DriverPose_t ServerDriverHook::BuildDisconnectedPose() const
     pose.deviceIsConnected = false;
     pose.willDriftInYaw = false;
     pose.shouldApplyHeadModel = false;
+    return pose;
+}
+
+vr::DriverPose_t ServerDriverHook::BuildDriverPose(const LivePoseSlot& live_pose) const
+{
+    if (live_pose.sample_present == 0u)
+    {
+        return BuildDisconnectedPose();
+    }
+
+    vr::DriverPose_t pose{};
+    pose.poseTimeOffset = 0.0;
+    pose.qWorldFromDriverRotation.w = 1.0;
+    pose.qDriverFromHeadRotation.w = 1.0;
+    pose.qRotation.w = live_pose.rotation_wxyz[0];
+    pose.qRotation.x = live_pose.rotation_wxyz[1];
+    pose.qRotation.y = live_pose.rotation_wxyz[2];
+    pose.qRotation.z = live_pose.rotation_wxyz[3];
+    pose.vecPosition[0] = live_pose.position_m[0];
+    pose.vecPosition[1] = live_pose.position_m[1];
+    pose.vecPosition[2] = live_pose.position_m[2];
+    pose.vecVelocity[0] = live_pose.linear_velocity_mps[0];
+    pose.vecVelocity[1] = live_pose.linear_velocity_mps[1];
+    pose.vecVelocity[2] = live_pose.linear_velocity_mps[2];
+    pose.vecAngularVelocity[0] = live_pose.angular_velocity_rps[0];
+    pose.vecAngularVelocity[1] = live_pose.angular_velocity_rps[1];
+    pose.vecAngularVelocity[2] = live_pose.angular_velocity_rps[2];
+    pose.poseIsValid = live_pose.pose_valid != 0u;
+    pose.deviceIsConnected = live_pose.device_connected != 0u;
+    pose.willDriftInYaw = false;
+    pose.shouldApplyHeadModel = false;
+    pose.result = static_cast<vr::ETrackingResult>(live_pose.tracking_result);
     return pose;
 }
 
@@ -302,8 +394,21 @@ void ServerDriverHook::HandleTrackedDevicePoseUpdated(
         return;
     }
 
-    if (ShouldSuppressDevice(which_device))
+    LiveMode live_mode = LiveMode::Passthrough;
+    std::uint32_t slot_index = 0u;
+    if (ResolveTargetDevice(which_device, &live_mode, &slot_index))
     {
+        if (live_mode == LiveMode::Replace)
+        {
+            if (shared_state_ != nullptr)
+            {
+                ++shared_state_->pose_updates_replaced;
+            }
+            const vr::DriverPose_t replacement_pose = BuildDriverPose(shared_state_->live_poses[slot_index]);
+            original_tracked_device_pose_updated_(self, which_device, replacement_pose, pose_struct_size);
+            return;
+        }
+
         if (shared_state_ != nullptr)
         {
             ++shared_state_->pose_updates_suppressed;
@@ -397,9 +502,18 @@ vr::DriverPose_t ServerDriverHook::TrackedDeviceProxy::GetPose()
     }
 
     const vr::DriverPose_t pose = inner_driver_->GetPose();
-    if (owner_ != nullptr && owner_->ShouldSuppressDevice(object_id_))
+    if (owner_ != nullptr)
     {
-        return owner_->BuildDisconnectedPose();
+        LiveMode live_mode = LiveMode::Passthrough;
+        std::uint32_t slot_index = 0u;
+        if (owner_->ResolveTargetDevice(object_id_, &live_mode, &slot_index))
+        {
+            if (live_mode == LiveMode::Replace)
+            {
+                return owner_->BuildDriverPose(owner_->shared_state_->live_poses[slot_index]);
+            }
+            return owner_->BuildDisconnectedPose();
+        }
     }
     return pose;
 }

@@ -39,6 +39,7 @@ private:
     void WriteRuntimeStatus(const std::string& status_text, const std::string& last_error);
     void WriteLoadedSessionMetadata();
     void WritePlaybackStateSetting();
+    bool ShouldPublishVirtualTrackers() const;
     static PlaybackState ParsePlaybackState(const std::string& value);
     static const char* PlaybackStateToString(PlaybackState value);
 
@@ -51,6 +52,7 @@ private:
     bool loop_enabled_ = true;
     double playback_speed_ = 1.0;
     PlaybackState playback_state_ = PlaybackState::Stopped;
+    std::string live_mode_ = "suppress";
     std::string requested_session_path_;
     std::string loaded_session_path_;
     std::string requested_playback_state_;

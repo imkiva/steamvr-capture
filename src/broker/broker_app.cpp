@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -74,6 +75,59 @@ bool ReadSettingsBool(const char* section, const char* key, const bool fallback)
     return error == vr::VRSettingsError_None ? value : fallback;
 }
 
+double ReadSettingsFloat(const char* section, const char* key, const double fallback)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    const float value = vr::VRSettings()->GetFloat(section, key, &error);
+    return (error == vr::VRSettingsError_None && value > 0.0f) ? static_cast<double>(value) : fallback;
+}
+
+std::string NormalizePlaybackState(const std::string& playback_state)
+{
+    if (playback_state == "playing" || playback_state == "paused")
+    {
+        return playback_state;
+    }
+
+    return "stopped";
+}
+
+hotpatch::LiveMode ParseLiveModeSetting(const std::string& live_mode, const bool suppress_real_trackers)
+{
+    if (live_mode == "replace")
+    {
+        return hotpatch::LiveMode::Replace;
+    }
+
+    if (live_mode == "suppress")
+    {
+        return hotpatch::LiveMode::Suppress;
+    }
+
+    if (live_mode == "passthrough")
+    {
+        return hotpatch::LiveMode::Passthrough;
+    }
+
+    return suppress_real_trackers ? hotpatch::LiveMode::Suppress : hotpatch::LiveMode::Passthrough;
+}
+
+const wchar_t* LiveModeStatusText(const hotpatch::LiveMode live_mode)
+{
+    switch (live_mode)
+    {
+    case hotpatch::LiveMode::Replace:
+        return L"replace";
+
+    case hotpatch::LiveMode::Suppress:
+        return L"suppress";
+
+    case hotpatch::LiveMode::Passthrough:
+    default:
+        return L"passthrough";
+    }
+}
+
 std::string DescribeWindowsError(const DWORD error_code)
 {
     LPSTR message_buffer = nullptr;
@@ -137,6 +191,8 @@ bool BrokerApp::Init(std::string* error)
         return false;
     }
 
+    playback_started_at_ = std::chrono::steady_clock::now();
+
     if (shared_state_ != nullptr)
     {
         shared_state_->broker_pid = GetCurrentProcessId();
@@ -157,6 +213,7 @@ int BrokerApp::Run(const bool once)
 {
     do
     {
+        const auto now = std::chrono::steady_clock::now();
         RefreshVrServerTarget();
         if (openvr_initialized_ && target_pid_ != openvr_target_pid_)
         {
@@ -175,8 +232,9 @@ int BrokerApp::Run(const bool once)
         else
         {
             PollReplayState();
+            AdvancePlayback(now);
             UpdateSharedState();
-            const bool should_inject = !session_path_.empty() && suppress_real_trackers_;
+            const bool should_inject = !session_path_.empty() && live_mode_ != hotpatch::LiveMode::Passthrough;
             if (should_inject)
             {
                 std::string inject_error;
@@ -198,7 +256,11 @@ int BrokerApp::Run(const bool once)
 
         if (!once)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const auto sleep_interval =
+                (playback_active_ && live_mode_ == hotpatch::LiveMode::Replace)
+                ? std::chrono::milliseconds(8)
+                : std::chrono::milliseconds(250);
+            std::this_thread::sleep_for(sleep_interval);
         }
     } while (!once);
 
@@ -223,6 +285,8 @@ int BrokerApp::PrintStatus()
     std::printf("tracked_device_add_calls=%u\n", shared_state_->tracked_device_add_calls);
     std::printf("pose_updates_seen=%u\n", shared_state_->pose_updates_seen);
     std::printf("pose_updates_suppressed=%u\n", shared_state_->pose_updates_suppressed);
+    std::printf("pose_updates_replaced=%u\n", shared_state_->pose_updates_replaced);
+    std::printf("playback_timestamp_ns=%llu\n", static_cast<unsigned long long>(shared_state_->playback_timestamp_ns));
     std::printf("session=%s\n", WideToUtf8(shared_state_->session_path).c_str());
     std::printf("broker_status=%s\n", WideToUtf8(shared_state_->broker_status_text).c_str());
     std::printf("dll_status=%s\n", WideToUtf8(shared_state_->dll_status_text).c_str());
@@ -380,6 +444,7 @@ void BrokerApp::PollReplayState()
         return;
     }
 
+    const auto now = std::chrono::steady_clock::now();
     const std::string loaded_session_path = ReadSettingsString(
         replay_settings::kDriverSection,
         replay_settings::kLoadedSessionPathKey);
@@ -390,28 +455,79 @@ void BrokerApp::PollReplayState()
     const std::string playback_state = ReadSettingsString(
         replay_settings::kDriverSection,
         replay_settings::kPlaybackStateKey);
+    const std::string live_mode_setting = ReadSettingsString(
+        replay_settings::kHotpatchSection,
+        replay_settings::kLiveModeKey);
     const bool suppress_real_trackers = ReadSettingsBool(
         replay_settings::kHotpatchSection,
         replay_settings::kSuppressRealTrackersKey,
         true);
+    const bool loop_enabled = ReadSettingsBool(
+        replay_settings::kDriverSection,
+        replay_settings::kLoopKey,
+        true);
+    const double playback_speed = ReadSettingsFloat(
+        replay_settings::kDriverSection,
+        replay_settings::kPlaybackSpeedKey,
+        1.0);
 
-    const bool state_changed = session_path_ != next_session_path || playback_state_ != playback_state ||
-        suppress_real_trackers_ != suppress_real_trackers;
+    const hotpatch::LiveMode live_mode = ParseLiveModeSetting(live_mode_setting, suppress_real_trackers);
+    const std::string normalized_playback_state = NormalizePlaybackState(playback_state);
+    const bool session_changed = session_path_ != next_session_path;
+    const bool playback_state_changed = playback_state_ != normalized_playback_state;
+    const bool speed_changed = std::abs(playback_speed_ - playback_speed) > 0.0001;
+    const bool loop_changed = loop_enabled_ != loop_enabled;
+    const bool live_mode_changed = live_mode_ != live_mode || suppress_real_trackers_ != suppress_real_trackers;
+    const bool state_changed = session_changed || playback_state_changed || speed_changed || loop_changed || live_mode_changed;
 
     session_path_ = next_session_path;
-    playback_state_ = playback_state.empty() ? "stopped" : playback_state;
+    suppress_real_trackers_ = suppress_real_trackers;
+    live_mode_ = live_mode;
+
+    if (session_changed)
+    {
+        LoadSessionTargets();
+    }
+
+    if (speed_changed)
+    {
+        AdvancePlayback(now);
+        playback_speed_ = playback_speed;
+        playback_base_timestamp_ns_ = playback_timestamp_ns_;
+        playback_started_at_ = now;
+    }
+    else
+    {
+        playback_speed_ = playback_speed;
+    }
+
+    loop_enabled_ = loop_enabled;
+
+    if (playback_state_changed)
+    {
+        SetPlaybackState(normalized_playback_state, now);
+    }
+    else
+    {
+        playback_state_ = normalized_playback_state;
+    }
+
     suppress_real_trackers_ = suppress_real_trackers;
     playback_active_ = !session_path_.empty() && playback_state_ != "stopped";
 
     if (state_changed)
     {
-        LoadSessionTargets();
+        UpdateLivePoseSlots();
     }
 }
 
 void BrokerApp::LoadSessionTargets()
 {
     target_serials_.clear();
+    loaded_session_ = {};
+    playback_base_timestamp_ns_ = 0u;
+    playback_timestamp_ns_ = 0u;
+    playback_started_at_ = std::chrono::steady_clock::now();
 
     if (session_path_.empty())
     {
@@ -429,7 +545,9 @@ void BrokerApp::LoadSessionTargets()
         return;
     }
 
-    for (const session::TrackerDescriptor& tracker : session_data.trackers)
+    loaded_session_ = std::move(session_data);
+
+    for (const session::TrackerDescriptor& tracker : loaded_session_.trackers)
     {
         if (tracker.serial.empty())
         {
@@ -445,6 +563,138 @@ void BrokerApp::LoadSessionTargets()
     }
 }
 
+void BrokerApp::SetPlaybackState(const std::string& next_state, const std::chrono::steady_clock::time_point now)
+{
+    const std::string normalized_state = NormalizePlaybackState(next_state);
+    if (loaded_session_.trackers.empty() && normalized_state != "stopped")
+    {
+        playback_state_ = "stopped";
+        playback_base_timestamp_ns_ = 0u;
+        playback_timestamp_ns_ = 0u;
+        playback_started_at_ = now;
+        return;
+    }
+
+    AdvancePlayback(now);
+    playback_state_ = normalized_state;
+
+    if (playback_state_ == "playing")
+    {
+        playback_base_timestamp_ns_ = playback_timestamp_ns_;
+        playback_started_at_ = now;
+        return;
+    }
+
+    if (playback_state_ == "stopped")
+    {
+        playback_base_timestamp_ns_ = 0u;
+        playback_timestamp_ns_ = 0u;
+        playback_started_at_ = now;
+    }
+}
+
+void BrokerApp::AdvancePlayback(const std::chrono::steady_clock::time_point now)
+{
+    if (loaded_session_.duration_ns == 0u)
+    {
+        playback_timestamp_ns_ = 0u;
+        return;
+    }
+
+    if (playback_state_ == "stopped")
+    {
+        playback_timestamp_ns_ = 0u;
+        return;
+    }
+
+    if (playback_state_ == "paused")
+    {
+        return;
+    }
+
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - playback_started_at_).count();
+    const auto advanced_ns =
+        playback_base_timestamp_ns_ +
+        static_cast<std::uint64_t>(std::llround(static_cast<long double>(elapsed_ns) * playback_speed_));
+
+    if (loop_enabled_)
+    {
+        playback_timestamp_ns_ = advanced_ns % loaded_session_.duration_ns;
+        return;
+    }
+
+    if (advanced_ns >= loaded_session_.duration_ns)
+    {
+        playback_state_ = "stopped";
+        playback_base_timestamp_ns_ = 0u;
+        playback_timestamp_ns_ = 0u;
+        playback_started_at_ = now;
+        playback_active_ = false;
+        return;
+    }
+
+    playback_timestamp_ns_ = advanced_ns;
+}
+
+void BrokerApp::ClearLivePoseSlots()
+{
+    if (shared_state_ == nullptr)
+    {
+        return;
+    }
+
+    for (std::size_t index = 0; index < hotpatch::kMaxTrackedSerials; ++index)
+    {
+        shared_state_->live_poses[index] = hotpatch::LivePoseSlot{};
+    }
+}
+
+void BrokerApp::UpdateLivePoseSlots()
+{
+    if (shared_state_ == nullptr)
+    {
+        return;
+    }
+
+    ClearLivePoseSlots();
+
+    if (live_mode_ != hotpatch::LiveMode::Replace || !playback_active_)
+    {
+        return;
+    }
+
+    const std::size_t tracker_count = std::min<std::size_t>(loaded_session_.trackers.size(), hotpatch::kMaxTrackedSerials);
+    for (std::size_t tracker_index = 0; tracker_index < tracker_count; ++tracker_index)
+    {
+        const auto sample = session::SampleAtOrBefore(loaded_session_, tracker_index, playback_timestamp_ns_);
+        if (!sample.has_value())
+        {
+            continue;
+        }
+
+        hotpatch::LivePoseSlot& live_pose = shared_state_->live_poses[tracker_index];
+        live_pose = hotpatch::LivePoseSlot{};
+        live_pose.sample_present = 1u;
+        live_pose.device_connected = sample->device_connected ? 1u : 0u;
+        live_pose.pose_valid = sample->pose_valid ? 1u : 0u;
+        live_pose.tracking_result = sample->tracking_result;
+        live_pose.sample_timestamp_ns = sample->timestamp_ns;
+
+        for (std::size_t axis = 0; axis < 3u; ++axis)
+        {
+            live_pose.position_m[axis] = sample->position_m[axis];
+            live_pose.linear_velocity_mps[axis] = sample->linear_velocity_mps[axis];
+            live_pose.angular_velocity_rps[axis] = sample->angular_velocity_rps[axis];
+        }
+
+        for (std::size_t component = 0; component < 4u; ++component)
+        {
+            live_pose.rotation_wxyz[component] = sample->rotation_wxyz[component];
+        }
+    }
+}
+
 void BrokerApp::RefreshVrServerTarget()
 {
     target_pid_ = FindProcessIdByName("vrserver.exe");
@@ -457,13 +707,14 @@ void BrokerApp::UpdateSharedState()
         return;
     }
 
+    UpdateLivePoseSlots();
     shared_state_->broker_pid = GetCurrentProcessId();
     shared_state_->target_pid = target_pid_;
     shared_state_->playback_active = playback_active_ ? 1u : 0u;
-    shared_state_->suppress_real_trackers = suppress_real_trackers_ ? 1u : 0u;
-    shared_state_->live_mode = static_cast<std::uint32_t>(
-        suppress_real_trackers_ ? hotpatch::LiveMode::Suppress : hotpatch::LiveMode::Passthrough);
+    shared_state_->suppress_real_trackers = live_mode_ == hotpatch::LiveMode::Passthrough ? 0u : 1u;
+    shared_state_->live_mode = static_cast<std::uint32_t>(live_mode_);
     shared_state_->serial_count = static_cast<std::uint32_t>(target_serials_.size());
+    shared_state_->playback_timestamp_ns = playback_timestamp_ns_;
     CopyWideText(shared_state_->session_path, Utf8ToWide(session_path_));
 
     for (std::size_t index = 0; index < hotpatch::kMaxTrackedSerials; ++index)
@@ -488,11 +739,18 @@ void BrokerApp::UpdateSharedState()
             shared_state_->broker_status_text,
             session_path_.empty()
                 ? L"Broker idle. No replay session is selected."
-                : L"Broker armed. Session is loaded and waiting for playback.");
+                : std::wstring(L"Broker armed in ") + LiveModeStatusText(live_mode_) + L" mode. Session is loaded and waiting for playback.");
     }
     else
     {
-        CopyWideText(shared_state_->broker_status_text, L"Broker active. Ensuring hotpatch injection.");
+        if (live_mode_ == hotpatch::LiveMode::Replace)
+        {
+            CopyWideText(shared_state_->broker_status_text, L"Broker active. Streaming recorded poses into the hotpatch table.");
+        }
+        else
+        {
+            CopyWideText(shared_state_->broker_status_text, L"Broker active. Ensuring hotpatch injection.");
+        }
     }
 }
 

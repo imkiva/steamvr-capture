@@ -17,6 +17,7 @@ constexpr char kLoadedTrackerCountKey[] = "loaded_tracker_count";
 constexpr char kStatusTextKey[] = "status_text";
 constexpr char kLastErrorKey[] = "last_error";
 constexpr char kSuppressRealTrackersKey[] = "suppress_real_trackers";
+constexpr char kLiveModeKey[] = "live_mode";
 
 constexpr char kSessionRootKey[] = "session_root";
 

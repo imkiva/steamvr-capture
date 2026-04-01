@@ -55,7 +55,7 @@ enum class ButtonAction
     Pause,
     Stop,
     ToggleLoop,
-    ToggleRealTrackerSuppress,
+    CycleLiveMode,
     EditRoot,
     EditPath,
     PasteClipboard,
@@ -587,8 +587,9 @@ struct OverlayState
     std::uint32_t hotpatch_tracked_device_add_calls = 0;
     std::uint32_t hotpatch_pose_updates_seen = 0;
     std::uint32_t hotpatch_pose_updates_suppressed = 0;
+    std::uint32_t hotpatch_pose_updates_replaced = 0;
     bool loop_enabled = true;
-    bool suppress_real_trackers = true;
+    std::string live_mode = "suppress";
     std::chrono::steady_clock::time_point last_settings_refresh{};
     KeyboardMode keyboard_mode = KeyboardMode::None;
     std::vector<Button> buttons;
@@ -607,6 +608,7 @@ struct HotpatchSnapshot
     std::uint32_t tracked_device_add_calls = 0;
     std::uint32_t pose_updates_seen = 0;
     std::uint32_t pose_updates_suppressed = 0;
+    std::uint32_t pose_updates_replaced = 0;
 };
 
 const char* HookStateLabel(const hotpatch::HookState state)
@@ -635,6 +637,48 @@ const char* HookStateLabel(const hotpatch::HookState state)
     return "unknown";
 }
 
+std::string NormalizeLiveModeSetting(const std::string& live_mode, const bool suppress_real_trackers_fallback = true)
+{
+    if (live_mode == "replace" || live_mode == "suppress" || live_mode == "passthrough")
+    {
+        return live_mode;
+    }
+
+    return suppress_real_trackers_fallback ? "suppress" : "passthrough";
+}
+
+std::string NextLiveModeSetting(const std::string& current_live_mode)
+{
+    const std::string normalized = NormalizeLiveModeSetting(current_live_mode);
+    if (normalized == "suppress")
+    {
+        return "replace";
+    }
+
+    if (normalized == "replace")
+    {
+        return "passthrough";
+    }
+
+    return "suppress";
+}
+
+std::wstring LiveModeLabel(const std::string& live_mode)
+{
+    const std::string normalized = NormalizeLiveModeSetting(live_mode);
+    if (normalized == "replace")
+    {
+        return L"Replace";
+    }
+
+    if (normalized == "passthrough")
+    {
+        return L"Passthrough";
+    }
+
+    return L"Suppress";
+}
+
 bool CopyHotpatchSnapshot(const hotpatch::SharedState* shared_state, HotpatchSnapshot* snapshot)
 {
     if (shared_state == nullptr || snapshot == nullptr)
@@ -658,6 +702,7 @@ bool CopyHotpatchSnapshot(const hotpatch::SharedState* shared_state, HotpatchSna
     snapshot->tracked_device_add_calls = shared_copy.tracked_device_add_calls;
     snapshot->pose_updates_seen = shared_copy.pose_updates_seen;
     snapshot->pose_updates_suppressed = shared_copy.pose_updates_suppressed;
+    snapshot->pose_updates_replaced = shared_copy.pose_updates_replaced;
     return true;
 }
 }  // namespace
@@ -701,6 +746,7 @@ struct OverlayApp::Impl
     void CloseHotpatchStateMapping();
     HotpatchSnapshot ReadHotpatchSnapshot() const;
     void UpdateHotpatchPlaybackHint(const char* playback_state);
+    void UpdateHotpatchLiveModeHint(const std::string& live_mode);
     void PumpGlobalEvents();
     void PumpOverlayEvents(vr::VROverlayHandle_t overlay_handle);
     void HandleMouseButtonUp(LONG x, LONG y);
@@ -920,6 +966,38 @@ void OverlayApp::Impl::UpdateHotpatchPlaybackHint(const char* playback_state)
     const bool has_session = !state.loaded_session_utf8.empty() || !state.requested_session_utf8.empty();
     const bool playback_active = has_session && ::strcmp(playback_state, "stopped") != 0;
     shared_state->playback_active = playback_active ? 1u : 0u;
+}
+
+void OverlayApp::Impl::UpdateHotpatchLiveModeHint(const std::string& live_mode)
+{
+    if (!EnsureHotpatchStateMapped())
+    {
+        return;
+    }
+
+    auto* shared_state = const_cast<hotpatch::SharedState*>(hotpatch_shared_state);
+    if (shared_state == nullptr)
+    {
+        return;
+    }
+
+    const std::string normalized = NormalizeLiveModeSetting(live_mode);
+    if (normalized == "replace")
+    {
+        shared_state->live_mode = static_cast<std::uint32_t>(hotpatch::LiveMode::Replace);
+        shared_state->suppress_real_trackers = 1u;
+        return;
+    }
+
+    if (normalized == "passthrough")
+    {
+        shared_state->live_mode = static_cast<std::uint32_t>(hotpatch::LiveMode::Passthrough);
+        shared_state->suppress_real_trackers = 0u;
+        return;
+    }
+
+    shared_state->live_mode = static_cast<std::uint32_t>(hotpatch::LiveMode::Suppress);
+    shared_state->suppress_real_trackers = 1u;
 }
 
 void OverlayApp::Impl::PumpWindowMessages()
@@ -1143,9 +1221,12 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
         replay_settings::kHotpatchSection,
         replay_settings::kSuppressRealTrackersKey,
         true);
-    if (suppress_real_trackers != state.suppress_real_trackers)
+    const std::string live_mode = NormalizeLiveModeSetting(
+        ReadSettingsString(replay_settings::kHotpatchSection, replay_settings::kLiveModeKey),
+        suppress_real_trackers);
+    if (live_mode != state.live_mode)
     {
-        state.suppress_real_trackers = suppress_real_trackers;
+        state.live_mode = live_mode;
         dirty = true;
     }
 
@@ -1206,6 +1287,12 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
     if (hotpatch_snapshot.pose_updates_suppressed != state.hotpatch_pose_updates_suppressed)
     {
         state.hotpatch_pose_updates_suppressed = hotpatch_snapshot.pose_updates_suppressed;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.pose_updates_replaced != state.hotpatch_pose_updates_replaced)
+    {
+        state.hotpatch_pose_updates_replaced = hotpatch_snapshot.pose_updates_replaced;
         dirty = true;
     }
 
@@ -1424,15 +1511,18 @@ void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_
         state.dirty = true;
         return;
 
-    case ButtonAction::ToggleRealTrackerSuppress:
-        state.suppress_real_trackers = !state.suppress_real_trackers;
+    case ButtonAction::CycleLiveMode:
+        state.live_mode = NextLiveModeSetting(state.live_mode);
+        WriteSettingsString(
+            replay_settings::kHotpatchSection,
+            replay_settings::kLiveModeKey,
+            state.live_mode);
         WriteSettingsBool(
             replay_settings::kHotpatchSection,
             replay_settings::kSuppressRealTrackersKey,
-            state.suppress_real_trackers);
-        state.status_text = state.suppress_real_trackers
-            ? "Requested real tracker suppression"
-            : "Requested passthrough for real trackers";
+            state.live_mode != "passthrough");
+        UpdateHotpatchLiveModeHint(state.live_mode);
+        state.status_text = "Requested hotpatch live mode: " + state.live_mode;
         state.last_error.clear();
         state.dirty = true;
         return;
@@ -1798,12 +1888,12 @@ void OverlayApp::Impl::RenderMainOverlay()
         state.loop_enabled ? L"Loop: On" : L"Loop: Off");
     AddButton(
         RECT{920, 192, 1280, 244},
-        ButtonAction::ToggleRealTrackerSuppress,
+        ButtonAction::CycleLiveMode,
         0,
-        state.suppress_real_trackers ? L"Suppress Real: On" : L"Suppress Real: Off");
+        L"Live Mode: " + LiveModeLabel(state.live_mode));
 
-    const RECT left_panel{40, 276, 1010, 466};
-    const RECT right_panel{1040, 276, 1560, 466};
+    const RECT left_panel{40, 276, 1010, 490};
+    const RECT right_panel{1040, 276, 1560, 490};
     state.main_canvas.FillRectColor(left_panel, RGB(31, 39, 52));
     state.main_canvas.FillRectColor(right_panel, RGB(31, 39, 52));
     state.main_canvas.FrameRectColor(left_panel, RGB(73, 88, 109), 2);
@@ -1858,12 +1948,14 @@ void OverlayApp::Impl::RenderMainOverlay()
         L"Playback: " + Utf8ToWide(state.playback_state) + L" / " + (state.loop_enabled ? L"loop" : L"once") +
             L" / trackers " + Utf8ToWide(std::to_string(state.loaded_tracker_count)),
         RGB(218, 186, 97));
+    draw_runtime_line(L"Mode: " + LiveModeLabel(state.live_mode), RGB(133, 187, 237));
     draw_runtime_line(L"Hook: " + Utf8ToWide(state.hotpatch_hook_state), hook_color);
     draw_runtime_line(L"Broker: " + Utf8ToWide(state.hotpatch_broker_status), RGB(172, 187, 205));
     draw_runtime_line(L"Runtime: " + Utf8ToWide(state.hotpatch_dll_status), RGB(172, 187, 205));
     draw_runtime_line(
         L"Pose updates: " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_seen)) +
             L" / suppressed " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_suppressed)) +
+            L" / replaced " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_replaced)) +
             L" / add calls " + Utf8ToWide(std::to_string(state.hotpatch_tracked_device_add_calls)),
         RGB(172, 187, 205));
     draw_runtime_line(
@@ -1871,13 +1963,13 @@ void OverlayApp::Impl::RenderMainOverlay()
             L" / injected " + Utf8ToWide(std::to_string(state.hotpatch_injected_pid)),
         RGB(140, 154, 173));
 
-    state.main_canvas.DrawBody(L"Last Error", RECT{40, 488, 220, 520}, RGB(239, 244, 248));
+    state.main_canvas.DrawBody(L"Last Error", RECT{40, 506, 220, 538}, RGB(239, 244, 248));
     state.main_canvas.DrawSmall(
         TruncateMiddle(Utf8ToWide(state.last_error.empty() ? "<none>" : state.last_error), 150),
-        RECT{220, 490, 1560, 518},
+        RECT{220, 508, 1560, 536},
         state.last_error.empty() ? RGB(172, 187, 205) : RGB(236, 107, 102));
 
-    state.main_canvas.DrawBody(L"Sessions", RECT{40, 532, 220, 564}, RGB(239, 244, 248));
+    state.main_canvas.DrawBody(L"Sessions", RECT{40, 548, 220, 580}, RGB(239, 244, 248));
 
     const std::size_t page_count = std::max<std::size_t>(1, (state.session_files.size() + kPageSize - 1) / kPageSize);
     const std::size_t start_index = state.page_index * kPageSize;
@@ -1885,7 +1977,7 @@ void OverlayApp::Impl::RenderMainOverlay()
 
     if (state.session_files.empty())
     {
-        const RECT empty_panel{40, 580, 1560, 900};
+        const RECT empty_panel{40, 596, 1560, 900};
         state.main_canvas.FillRectColor(empty_panel, RGB(26, 31, 43));
         state.main_canvas.FrameRectColor(empty_panel, RGB(73, 88, 109), 2);
         state.main_canvas.DrawBody(
@@ -1900,7 +1992,7 @@ void OverlayApp::Impl::RenderMainOverlay()
     }
     else
     {
-        int row_top = 580;
+        int row_top = 596;
         for (std::size_t file_index = start_index; file_index < end_index; ++file_index)
         {
             const std::filesystem::path& session_path = state.session_files[file_index];
@@ -1958,7 +2050,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Suppress Real is driven by the live broker and injected DLL path, with no SteamVR restart required once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Use Play to start. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Live Mode cycles through Suppress, Replace, and Passthrough with no SteamVR restart once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -1998,7 +2090,8 @@ void OverlayApp::Impl::RenderThumbnailOverlay()
         TruncateMiddle(
             Utf8ToWide(
                 std::string("hook ") + state.hotpatch_hook_state + " / sup " +
-                std::to_string(state.hotpatch_pose_updates_suppressed)),
+                std::to_string(state.hotpatch_pose_updates_suppressed) + " / rep " +
+                std::to_string(state.hotpatch_pose_updates_replaced)),
             28),
         RECT{26, 206, 374, 238},
         state.hotpatch_hook_state == "hook_installed" ? RGB(109, 204, 163) : RGB(172, 187, 205));
@@ -2052,7 +2145,7 @@ void OverlayApp::Impl::AddButton(
         break;
 
     case ButtonAction::ToggleLoop:
-    case ButtonAction::ToggleRealTrackerSuppress:
+    case ButtonAction::CycleLiveMode:
         fill = RGB(48, 68, 97);
         frame = RGB(133, 187, 237);
         break;

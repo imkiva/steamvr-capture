@@ -6,7 +6,7 @@
 namespace steamvr_capture::hotpatch
 {
 constexpr std::uint32_t kProtocolMagic = 0x53564348u;
-constexpr std::uint32_t kProtocolVersion = 1u;
+constexpr std::uint32_t kProtocolVersion = 2u;
 constexpr wchar_t kSharedStateMappingName[] = L"Local\\SteamVRCaptureHotpatchState";
 constexpr std::size_t kMaxTrackedSerials = 16u;
 constexpr std::size_t kMaxWidePathCharacters = 260u;
@@ -35,6 +35,19 @@ struct TrackedSerialSlot
     wchar_t serial[kMaxWideSerialCharacters]{};
 };
 
+struct LivePoseSlot
+{
+    std::uint32_t sample_present = 0u;
+    std::uint32_t device_connected = 0u;
+    std::uint32_t pose_valid = 0u;
+    std::int32_t tracking_result = 0;
+    std::uint64_t sample_timestamp_ns = 0u;
+    double position_m[3]{};
+    double rotation_wxyz[4]{1.0, 0.0, 0.0, 0.0};
+    double linear_velocity_mps[3]{};
+    double angular_velocity_rps[3]{};
+};
+
 struct SharedState
 {
     std::uint32_t magic = kProtocolMagic;
@@ -51,13 +64,16 @@ struct SharedState
     std::uint32_t tracked_device_add_calls = 0u;
     std::uint32_t pose_updates_seen = 0u;
     std::uint32_t pose_updates_suppressed = 0u;
+    std::uint32_t pose_updates_replaced = 0u;
     std::uint64_t broker_heartbeat_ms = 0u;
     std::uint64_t injected_heartbeat_ms = 0u;
+    std::uint64_t playback_timestamp_ns = 0u;
     wchar_t session_path[kMaxWidePathCharacters]{};
     wchar_t hotpatch_dll_path[kMaxWidePathCharacters]{};
     wchar_t broker_status_text[kMaxWideStatusCharacters]{};
     wchar_t dll_status_text[kMaxWideStatusCharacters]{};
     TrackedSerialSlot serials[kMaxTrackedSerials]{};
+    LivePoseSlot live_poses[kMaxTrackedSerials]{};
 };
 
 static_assert(sizeof(SharedState) < 16384u, "Shared hotpatch state must remain compact.");

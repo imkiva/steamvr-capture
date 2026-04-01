@@ -31,6 +31,16 @@ double ReadSettingsFloat(const char* section, const char* key, const double fall
     const float value = vr::VRSettings()->GetFloat(section, key, &error);
     return (error == vr::VRSettingsError_None && value > 0.0f) ? static_cast<double>(value) : fallback;
 }
+
+std::string NormalizeLiveMode(const std::string& live_mode)
+{
+    if (live_mode == "replace" || live_mode == "suppress" || live_mode == "passthrough")
+    {
+        return live_mode;
+    }
+
+    return "suppress";
+}
 }  // namespace
 
 vr::EVRInitError DeviceProvider::Init(vr::IVRDriverContext* driver_context)
@@ -48,6 +58,7 @@ vr::EVRInitError DeviceProvider::Init(vr::IVRDriverContext* driver_context)
 
     loop_enabled_ = ReadSettingsBool(replay_settings::kDriverSection, replay_settings::kLoopKey, true);
     playback_speed_ = ReadSettingsFloat(replay_settings::kDriverSection, replay_settings::kPlaybackSpeedKey, 1.0);
+    live_mode_ = NormalizeLiveMode(ReadSettingsString(replay_settings::kHotpatchSection, replay_settings::kLiveModeKey));
     requested_playback_state_ =
         ReadSettingsString(replay_settings::kDriverSection, replay_settings::kPlaybackStateKey);
     playback_state_ = ParsePlaybackState(requested_playback_state_);
@@ -78,6 +89,12 @@ void DeviceProvider::RunFrame()
         for (std::size_t tracker_index = 0; tracker_index < tracker_devices_.size(); ++tracker_index)
         {
             if (tracker_index >= session_.trackers.size())
+            {
+                tracker_devices_[tracker_index]->SetDisconnected();
+                continue;
+            }
+
+            if (!ShouldPublishVirtualTrackers())
             {
                 tracker_devices_[tracker_index]->SetDisconnected();
                 continue;
@@ -144,6 +161,7 @@ void DeviceProvider::PollControlSettings()
     }
 
     loop_enabled_ = ReadSettingsBool(replay_settings::kDriverSection, replay_settings::kLoopKey, true);
+    live_mode_ = NormalizeLiveMode(ReadSettingsString(replay_settings::kHotpatchSection, replay_settings::kLiveModeKey));
 
     const std::string requested_session_path =
         ReadSettingsString(replay_settings::kDriverSection, replay_settings::kSessionPathKey);
@@ -392,6 +410,11 @@ void DeviceProvider::WritePlaybackStateSetting()
         replay_settings::kPlaybackStateKey,
         PlaybackStateToString(playback_state_),
         &error);
+}
+
+bool DeviceProvider::ShouldPublishVirtualTrackers() const
+{
+    return live_mode_ != "replace";
 }
 
 DeviceProvider::PlaybackState DeviceProvider::ParsePlaybackState(const std::string& value)
