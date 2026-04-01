@@ -1,7 +1,0 @@
-{
-  "driver_steamvr_capture_lighthouse_proxy": {
-    "enable": false,
-    "target_driver_path": "",
-    "suppress_replay_trackers": true
-  }
-}

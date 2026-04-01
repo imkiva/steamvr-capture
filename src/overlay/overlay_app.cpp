@@ -982,8 +982,8 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
     }
 
     const bool suppress_real_trackers = ReadSettingsBool(
-        replay_settings::kLighthouseProxySection,
-        replay_settings::kSuppressReplayTrackersKey,
+        replay_settings::kHotpatchSection,
+        replay_settings::kSuppressRealTrackersKey,
         true);
     if (suppress_real_trackers != state.suppress_real_trackers)
     {
@@ -1208,10 +1208,9 @@ void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_
 
     case ButtonAction::ToggleRealTrackerSuppress:
         state.suppress_real_trackers = !state.suppress_real_trackers;
-        WriteSettingsBool(replay_settings::kLighthouseProxySection, replay_settings::kEnableKey, true);
         WriteSettingsBool(
-            replay_settings::kLighthouseProxySection,
-            replay_settings::kSuppressReplayTrackersKey,
+            replay_settings::kHotpatchSection,
+            replay_settings::kSuppressRealTrackersKey,
             state.suppress_real_trackers);
         state.status_text = state.suppress_real_trackers
             ? "Requested real tracker suppression"
@@ -1710,7 +1709,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Suppress Real only takes effect when the experimental lighthouse proxy driver is registered and SteamVR has been restarted with it enabled. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Use Play to start. Suppress Real is driven by the live hotpatch broker and injected DLL path, with no SteamVR restart required once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);

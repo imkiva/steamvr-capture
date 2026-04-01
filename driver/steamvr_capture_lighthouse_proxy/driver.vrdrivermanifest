@@ -1,7 +1,0 @@
-{
-  "alwaysActivate": true,
-  "name": "steamvr_capture_lighthouse_proxy",
-  "directory": "",
-  "resourceOnly": false,
-  "hmd_presence": []
-}

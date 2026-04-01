@@ -382,8 +382,8 @@ void BrokerApp::PollReplayState()
         replay_settings::kDriverSection,
         replay_settings::kPlaybackStateKey);
     const bool suppress_real_trackers = ReadSettingsBool(
-        replay_settings::kLighthouseProxySection,
-        replay_settings::kSuppressReplayTrackersKey,
+        replay_settings::kHotpatchSection,
+        replay_settings::kSuppressRealTrackersKey,
         true);
 
     const bool state_changed = session_path_ != next_session_path || playback_state_ != playback_state ||
