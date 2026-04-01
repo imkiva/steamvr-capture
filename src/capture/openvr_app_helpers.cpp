@@ -6,6 +6,10 @@ namespace steamvr_capture::capture
 {
 namespace
 {
+constexpr const char* kReplaySerialPrefix = "svrcap_replay_slot_";
+constexpr const char* kReplayManufacturerName = "steamvr-capture";
+constexpr const char* kReplayControllerType = "svrcap_replay_tracker";
+
 std::string GetTrackedDeviceString(
     vr::IVRSystem& vr_system, const std::uint32_t device_index, const vr::ETrackedDeviceProperty property)
 {
@@ -120,6 +124,28 @@ std::array<double, 4> QuaternionFromMatrix(const vr::HmdMatrix34_t& matrix)
     NormalizeQuaternion(&quaternion);
     return quaternion;
 }
+
+bool IsReplayVirtualTracker(
+    vr::IVRSystem& vr_system,
+    const std::uint32_t device_index,
+    const std::string& serial)
+{
+    if (!serial.empty() && serial.rfind(kReplaySerialPrefix, 0) == 0)
+    {
+        return true;
+    }
+
+    const std::string manufacturer =
+        GetTrackedDeviceString(vr_system, device_index, vr::Prop_ManufacturerName_String);
+    if (manufacturer == kReplayManufacturerName)
+    {
+        return true;
+    }
+
+    const std::string controller_type =
+        GetTrackedDeviceString(vr_system, device_index, vr::Prop_ControllerType_String);
+    return controller_type == kReplayControllerType;
+}
 }  // namespace
 
 std::vector<TrackerSnapshot> EnumerateTrackers(vr::IVRSystem& vr_system, vr::IVRSettings& settings)
@@ -136,6 +162,10 @@ std::vector<TrackerSnapshot> EnumerateTrackers(vr::IVRSystem& vr_system, vr::IVR
         tracker.device_index = device_index;
         tracker.descriptor.serial =
             GetTrackedDeviceString(vr_system, device_index, vr::Prop_SerialNumber_String);
+        if (IsReplayVirtualTracker(vr_system, device_index, tracker.descriptor.serial))
+        {
+            continue;
+        }
         tracker.descriptor.tracking_system =
             GetTrackedDeviceString(vr_system, device_index, vr::Prop_TrackingSystemName_String);
         tracker.descriptor.model_number =

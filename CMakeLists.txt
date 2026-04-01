@@ -62,6 +62,7 @@ target_link_libraries(steamvr_capture_recorder
     PRIVATE
         steamvr_capture_session
         "${OPENVR_LIBRARY}"
+        winmm
 )
 
 target_compile_definitions(steamvr_capture_recorder

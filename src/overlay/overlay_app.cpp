@@ -15,8 +15,10 @@
 #include <cstdint>
 #include <cwctype>
 #include <filesystem>
+#include <iomanip>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -44,6 +46,7 @@ constexpr std::chrono::milliseconds kUiTickInterval(16);
 constexpr std::chrono::milliseconds kSettingsRefreshInterval(250);
 constexpr wchar_t kUiFontFace[] = L"Segoe UI";
 constexpr wchar_t kDesktopWindowClassName[] = L"SteamVRCaptureReplayDesktopWindow";
+constexpr std::array<float, 5> kRecordIntervalPresetsMs = {5.0f, 8.33f, 10.0f, 11.11f, 16.67f};
 
 enum class ButtonAction
 {
@@ -54,6 +57,9 @@ enum class ButtonAction
     Play,
     Pause,
     Stop,
+    StartRecording,
+    StopRecording,
+    EditRecordInterval,
     ToggleLoop,
     CycleLiveMode,
     EditRoot,
@@ -68,6 +74,7 @@ enum class KeyboardMode : std::uint64_t
     None = 0,
     SessionRoot = 1,
     DirectPath = 2,
+    RecordInterval = 3,
 };
 
 struct Button
@@ -211,6 +218,70 @@ bool EnsureBrokerRunning(const std::filesystem::path& exe_directory, std::string
     return true;
 }
 
+bool LaunchHiddenProcess(
+    const std::filesystem::path& executable_path,
+    const std::vector<std::wstring>& arguments,
+    const std::filesystem::path& working_directory,
+    PROCESS_INFORMATION* process_info,
+    std::string* error)
+{
+    if (process_info == nullptr)
+    {
+        return false;
+    }
+
+    std::error_code filesystem_error;
+    if (!std::filesystem::exists(executable_path, filesystem_error))
+    {
+        if (error != nullptr)
+        {
+            *error = "Executable was not found: " + executable_path.string();
+        }
+        return false;
+    }
+
+    std::wstring command_line = L"\"" + executable_path.wstring() + L"\"";
+    for (const std::wstring& argument : arguments)
+    {
+        command_line += L" \"";
+        for (const wchar_t ch : argument)
+        {
+            if (ch == L'"')
+            {
+                command_line += L'\\';
+            }
+            command_line += ch;
+        }
+        command_line += L"\"";
+    }
+
+    STARTUPINFOW startup_info{};
+    startup_info.cb = sizeof(startup_info);
+    *process_info = PROCESS_INFORMATION{};
+
+    const BOOL started = CreateProcessW(
+        executable_path.c_str(),
+        command_line.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        working_directory.empty() ? nullptr : working_directory.wstring().c_str(),
+        &startup_info,
+        process_info);
+    if (!started)
+    {
+        if (error != nullptr)
+        {
+            *error = "Failed to start process: " + executable_path.string();
+        }
+        return false;
+    }
+
+    return true;
+}
+
 std::string ReadSettingsString(const char* section, const char* key)
 {
     char buffer[4096] = {};
@@ -226,6 +297,13 @@ std::int32_t ReadSettingsInt(const char* section, const char* key, const std::in
     return error == vr::VRSettingsError_None ? value : fallback;
 }
 
+float ReadSettingsFloat(const char* section, const char* key, const float fallback)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    const float value = vr::VRSettings()->GetFloat(section, key, &error);
+    return error == vr::VRSettingsError_None ? value : fallback;
+}
+
 void WriteSettingsString(const char* section, const char* key, const std::string& value)
 {
     vr::EVRSettingsError error = vr::VRSettingsError_None;
@@ -236,6 +314,12 @@ void WriteSettingsInt(const char* section, const char* key, const std::int32_t v
 {
     vr::EVRSettingsError error = vr::VRSettingsError_None;
     vr::VRSettings()->SetInt32(section, key, value, &error);
+}
+
+void WriteSettingsFloat(const char* section, const char* key, const float value)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->SetFloat(section, key, value, &error);
 }
 
 void WriteSettingsBool(const char* section, const char* key, const bool value)
@@ -249,6 +333,55 @@ bool ReadSettingsBool(const char* section, const char* key, const bool fallback)
     vr::EVRSettingsError error = vr::VRSettingsError_None;
     const bool value = vr::VRSettings()->GetBool(section, key, &error);
     return error == vr::VRSettingsError_None ? value : fallback;
+}
+
+float NormalizeRecordIntervalMs(const float value)
+{
+    return value > 0.0f ? value : replay_settings::kDefaultRecordIntervalMs;
+}
+
+bool TryParsePositiveFloat(const std::string& text, float* value)
+{
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    try
+    {
+        const float parsed = std::stof(text);
+        if (!(parsed > 0.0f))
+        {
+            return false;
+        }
+        *value = parsed;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+std::string FormatRecordIntervalMs(const float value)
+{
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(value == std::round(value) ? 0 : 2) << value;
+    return stream.str();
+}
+
+float NextRecordIntervalPresetMs(const float current_value)
+{
+    const float normalized = NormalizeRecordIntervalMs(current_value);
+    for (const float candidate : kRecordIntervalPresetsMs)
+    {
+        if (candidate > normalized + 0.01f)
+        {
+            return candidate;
+        }
+    }
+
+    return kRecordIntervalPresetsMs.front();
 }
 
 std::filesystem::path ToAbsolutePath(const std::filesystem::path& path)
@@ -366,6 +499,47 @@ std::filesystem::path FindDefaultSessionRoot(const std::filesystem::path& exe_di
     }
 
     return {};
+}
+
+std::wstring MakeRecorderStopEventName()
+{
+    return L"Local\\SteamVRCaptureRecorderStop_" +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+}
+
+std::filesystem::path BuildRecordingFilename(const std::filesystem::path& directory)
+{
+    SYSTEMTIME local_time{};
+    GetLocalTime(&local_time);
+
+    wchar_t stem_buffer[64]{};
+    swprintf_s(
+        stem_buffer,
+        L"capture_%04u%02u%02u_%02u%02u%02u",
+        static_cast<unsigned>(local_time.wYear),
+        static_cast<unsigned>(local_time.wMonth),
+        static_cast<unsigned>(local_time.wDay),
+        static_cast<unsigned>(local_time.wHour),
+        static_cast<unsigned>(local_time.wMinute),
+        static_cast<unsigned>(local_time.wSecond));
+
+    std::filesystem::path candidate = directory / (std::wstring(stem_buffer) + L".svrcap");
+    if (!std::filesystem::exists(candidate))
+    {
+        return candidate;
+    }
+
+    for (int suffix = 1; suffix < 1000; ++suffix)
+    {
+        candidate = directory / (std::wstring(stem_buffer) + L"_" + std::to_wstring(suffix) + L".svrcap");
+        if (!std::filesystem::exists(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return directory / (std::wstring(stem_buffer) + L"_overflow.svrcap");
 }
 
 std::string GetApplicationsErrorName(const vr::EVRApplicationError error)
@@ -590,6 +764,10 @@ struct OverlayState
     std::uint32_t hotpatch_pose_updates_replaced = 0;
     bool loop_enabled = true;
     std::string live_mode = "suppress";
+    float record_interval_ms = replay_settings::kDefaultRecordIntervalMs;
+    bool recording_active = false;
+    std::string recording_output_utf8;
+    std::string recording_status = "Recorder idle.";
     std::chrono::steady_clock::time_point last_settings_refresh{};
     KeyboardMode keyboard_mode = KeyboardMode::None;
     std::vector<Button> buttons;
@@ -747,6 +925,10 @@ struct OverlayApp::Impl
     HotpatchSnapshot ReadHotpatchSnapshot() const;
     void UpdateHotpatchPlaybackHint(const char* playback_state);
     void UpdateHotpatchLiveModeHint(const std::string& live_mode);
+    std::filesystem::path ResolveRecordingDirectory() const;
+    bool StartRecording();
+    void StopRecording(bool refresh_sessions);
+    void PollRecordingProcess();
     void PumpGlobalEvents();
     void PumpOverlayEvents(vr::VROverlayHandle_t overlay_handle);
     void HandleMouseButtonUp(LONG x, LONG y);
@@ -770,6 +952,9 @@ struct OverlayApp::Impl
 
     HANDLE hotpatch_mapping = nullptr;
     const hotpatch::SharedState* hotpatch_shared_state = nullptr;
+    HANDLE recorder_stop_event = nullptr;
+    HANDLE recorder_process = nullptr;
+    DWORD recorder_process_id = 0;
 };
 
 void GdiCanvas::DrawTextBox(const std::wstring& text, const RECT& rect, HFONT font, COLORREF color, UINT format)
@@ -1000,6 +1185,189 @@ void OverlayApp::Impl::UpdateHotpatchLiveModeHint(const std::string& live_mode)
     shared_state->suppress_real_trackers = 1u;
 }
 
+std::filesystem::path OverlayApp::Impl::ResolveRecordingDirectory() const
+{
+    auto candidate_parent = [](const std::string& path_utf8) -> std::filesystem::path
+    {
+        if (path_utf8.empty())
+        {
+            return {};
+        }
+
+        const std::filesystem::path path = ToAbsolutePath(Utf8Path(path_utf8));
+        if (path.empty())
+        {
+            return {};
+        }
+
+        return path.has_extension() ? path.parent_path() : path;
+    };
+
+    std::filesystem::path directory = candidate_parent(state.requested_session_utf8);
+    if (!directory.empty())
+    {
+        return directory;
+    }
+
+    directory = candidate_parent(state.loaded_session_utf8);
+    if (!directory.empty())
+    {
+        return directory;
+    }
+
+    directory = candidate_parent(state.session_root_utf8);
+    if (!directory.empty())
+    {
+        return directory;
+    }
+
+    directory = FindDefaultSessionRoot(state.exe_path.parent_path());
+    if (!directory.empty())
+    {
+        return directory;
+    }
+
+    return state.exe_path.parent_path() / "sessions";
+}
+
+bool OverlayApp::Impl::StartRecording()
+{
+    if (state.recording_active)
+    {
+        return true;
+    }
+
+    const std::filesystem::path recorder_path = state.exe_path.parent_path() / L"steamvr_capture_recorder.exe";
+    const std::filesystem::path recording_directory = ResolveRecordingDirectory();
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(recording_directory, filesystem_error);
+    if (filesystem_error)
+    {
+        state.last_error = "Failed to create recording directory: " + recording_directory.string();
+        state.dirty = true;
+        return false;
+    }
+
+    const std::filesystem::path output_path = BuildRecordingFilename(recording_directory);
+    const std::wstring stop_event_name = MakeRecorderStopEventName();
+    const std::wstring interval_ms = Utf8ToWide(FormatRecordIntervalMs(state.record_interval_ms));
+    recorder_stop_event = CreateEventW(nullptr, TRUE, FALSE, stop_event_name.c_str());
+    if (recorder_stop_event == nullptr)
+    {
+        state.last_error = "Failed to create recorder stop event.";
+        state.dirty = true;
+        return false;
+    }
+
+    PROCESS_INFORMATION process_info{};
+    std::string launch_error;
+    const bool started = LaunchHiddenProcess(
+        recorder_path,
+        {L"--record", output_path.wstring(), L"--until-event", stop_event_name, L"--interval-ms", interval_ms},
+        state.exe_path.parent_path(),
+        &process_info,
+        &launch_error);
+    if (!started)
+    {
+        CloseHandle(recorder_stop_event);
+        recorder_stop_event = nullptr;
+        state.last_error = launch_error;
+        state.dirty = true;
+        return false;
+    }
+
+    CloseHandle(process_info.hThread);
+    recorder_process = process_info.hProcess;
+    recorder_process_id = process_info.dwProcessId;
+    state.recording_active = true;
+    state.recording_output_utf8 = PathToUtf8(output_path);
+    state.recording_status = "Recording at " + FormatRecordIntervalMs(state.record_interval_ms) +
+        " ms to " + state.recording_output_utf8;
+    state.status_text = "Recording session";
+    state.last_error.clear();
+    state.dirty = true;
+    return true;
+}
+
+void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
+{
+    if (recorder_stop_event != nullptr)
+    {
+        SetEvent(recorder_stop_event);
+    }
+
+    if (recorder_process != nullptr)
+    {
+        const DWORD wait_result = WaitForSingleObject(recorder_process, 5000);
+        if (wait_result == WAIT_TIMEOUT)
+        {
+            state.last_error = "Recorder is still shutting down. Please try again in a moment.";
+            state.dirty = true;
+            return;
+        }
+
+        CloseHandle(recorder_process);
+        recorder_process = nullptr;
+    }
+
+    if (recorder_stop_event != nullptr)
+    {
+        CloseHandle(recorder_stop_event);
+        recorder_stop_event = nullptr;
+    }
+
+    recorder_process_id = 0;
+    if (state.recording_active)
+    {
+        state.recording_active = false;
+        state.recording_status = state.recording_output_utf8.empty()
+            ? "Recorder idle."
+            : "Saved recording to " + state.recording_output_utf8;
+        state.status_text = "Recording complete";
+        state.dirty = true;
+        if (refresh_sessions)
+        {
+            RefreshSettings(true);
+        }
+    }
+}
+
+void OverlayApp::Impl::PollRecordingProcess()
+{
+    if (recorder_process == nullptr)
+    {
+        return;
+    }
+
+    const DWORD wait_result = WaitForSingleObject(recorder_process, 0);
+    if (wait_result == WAIT_TIMEOUT)
+    {
+        return;
+    }
+
+    DWORD exit_code = 0;
+    GetExitCodeProcess(recorder_process, &exit_code);
+    CloseHandle(recorder_process);
+    recorder_process = nullptr;
+    if (recorder_stop_event != nullptr)
+    {
+        CloseHandle(recorder_stop_event);
+        recorder_stop_event = nullptr;
+    }
+
+    recorder_process_id = 0;
+    state.recording_active = false;
+    state.recording_status = exit_code == 0
+        ? "Saved recording to " + state.recording_output_utf8
+        : "Recorder exited with code " + std::to_string(exit_code);
+    if (exit_code != 0)
+    {
+        state.last_error = state.recording_status;
+    }
+    RefreshSettings(true);
+    state.dirty = true;
+}
+
 void OverlayApp::Impl::PumpWindowMessages()
 {
     MSG message{};
@@ -1090,6 +1458,7 @@ bool OverlayApp::Impl::Init(std::string* error)
 
 void OverlayApp::Impl::Shutdown()
 {
+    StopRecording(false);
     CloseHotpatchStateMapping();
     DestroyDesktopWindow();
 
@@ -1117,6 +1486,7 @@ int OverlayApp::Impl::Run()
     while (!state.quit_requested)
     {
         PumpWindowMessages();
+        PollRecordingProcess();
         PumpGlobalEvents();
         PumpOverlayEvents(state.main_overlay);
         PumpOverlayEvents(state.thumbnail_overlay);
@@ -1214,6 +1584,16 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
     if (loop_enabled != state.loop_enabled)
     {
         state.loop_enabled = loop_enabled;
+        dirty = true;
+    }
+
+    const float record_interval_ms = NormalizeRecordIntervalMs(ReadSettingsFloat(
+        replay_settings::kOverlaySection,
+        replay_settings::kRecordIntervalMsKey,
+        replay_settings::kDefaultRecordIntervalMs));
+    if (std::fabs(record_interval_ms - state.record_interval_ms) > 0.01f)
+    {
+        state.record_interval_ms = record_interval_ms;
         dirty = true;
     }
 
@@ -1505,6 +1885,35 @@ void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_
         RequestPlaybackState("stopped");
         return;
 
+    case ButtonAction::StartRecording:
+        StartRecording();
+        return;
+
+    case ButtonAction::StopRecording:
+        StopRecording(true);
+        return;
+
+    case ButtonAction::EditRecordInterval:
+        if (from_desktop)
+        {
+            state.record_interval_ms = NextRecordIntervalPresetMs(state.record_interval_ms);
+            WriteSettingsFloat(
+                replay_settings::kOverlaySection,
+                replay_settings::kRecordIntervalMsKey,
+                state.record_interval_ms);
+            state.status_text = "Record interval set to " + FormatRecordIntervalMs(state.record_interval_ms) + " ms";
+            state.last_error.clear();
+            state.dirty = true;
+        }
+        else
+        {
+            OpenKeyboard(
+                KeyboardMode::RecordInterval,
+                FormatRecordIntervalMs(state.record_interval_ms),
+                "Record interval in milliseconds");
+        }
+        return;
+
     case ButtonAction::ToggleLoop:
         state.loop_enabled = !state.loop_enabled;
         WriteSettingsBool(replay_settings::kDriverSection, replay_settings::kLoopKey, state.loop_enabled);
@@ -1644,6 +2053,25 @@ void OverlayApp::Impl::HandleKeyboardDone(const vr::VREvent_t& event)
             TriggerLoad(Utf8Path(input_text));
         }
         break;
+
+    case KeyboardMode::RecordInterval:
+    {
+        float interval_ms = 0.0f;
+        if (!TryParsePositiveFloat(input_text, &interval_ms))
+        {
+            state.last_error = "Record interval must be a positive number in milliseconds.";
+            break;
+        }
+
+        state.record_interval_ms = NormalizeRecordIntervalMs(interval_ms);
+        WriteSettingsFloat(
+            replay_settings::kOverlaySection,
+            replay_settings::kRecordIntervalMsKey,
+            state.record_interval_ms);
+        state.status_text = "Record interval set to " + FormatRecordIntervalMs(state.record_interval_ms) + " ms";
+        state.last_error.clear();
+        break;
+    }
 
     case KeyboardMode::None:
     default:
@@ -1878,16 +2306,31 @@ void OverlayApp::Impl::RenderMainOverlay()
     AddButton(RECT{1000, 124, 1220, 176}, ButtonAction::PasteClipboard, 0, L"Paste Clipboard");
     AddButton(RECT{1240, 124, 1510, 176}, ButtonAction::ReloadCurrent, 0, L"Reload Current");
 
-    AddButton(RECT{40, 192, 220, 244}, ButtonAction::Play, 0, L"Play");
-    AddButton(RECT{240, 192, 420, 244}, ButtonAction::Pause, 0, L"Pause");
-    AddButton(RECT{440, 192, 620, 244}, ButtonAction::Stop, 0, L"Stop");
+    AddButton(RECT{40, 192, 160, 244}, ButtonAction::Play, 0, L"Play");
+    AddButton(RECT{180, 192, 300, 244}, ButtonAction::Pause, 0, L"Pause");
+    AddButton(RECT{320, 192, 440, 244}, ButtonAction::Stop, 0, L"Stop");
     AddButton(
-        RECT{640, 192, 900, 244},
+        RECT{460, 192, 700, 244},
+        ButtonAction::EditRecordInterval,
+        0,
+        L"Rec: " + Utf8ToWide(FormatRecordIntervalMs(state.record_interval_ms)) + L" ms");
+    AddButton(
+        RECT{720, 192, 930, 244},
+        ButtonAction::StartRecording,
+        0,
+        state.recording_active ? L"Recording..." : L"Start Rec");
+    AddButton(
+        RECT{950, 192, 1160, 244},
+        ButtonAction::StopRecording,
+        0,
+        L"Stop Rec");
+    AddButton(
+        RECT{1180, 192, 1330, 244},
         ButtonAction::ToggleLoop,
         0,
         state.loop_enabled ? L"Loop: On" : L"Loop: Off");
     AddButton(
-        RECT{920, 192, 1280, 244},
+        RECT{1350, 192, 1560, 244},
         ButtonAction::CycleLiveMode,
         0,
         L"Live Mode: " + LiveModeLabel(state.live_mode));
@@ -1948,7 +2391,15 @@ void OverlayApp::Impl::RenderMainOverlay()
         L"Playback: " + Utf8ToWide(state.playback_state) + L" / " + (state.loop_enabled ? L"loop" : L"once") +
             L" / trackers " + Utf8ToWide(std::to_string(state.loaded_tracker_count)),
         RGB(218, 186, 97));
+    draw_runtime_line(
+        L"Record interval: " + Utf8ToWide(FormatRecordIntervalMs(state.record_interval_ms)) + L" ms",
+        RGB(133, 187, 237));
     draw_runtime_line(L"Mode: " + LiveModeLabel(state.live_mode), RGB(133, 187, 237));
+    draw_runtime_line(L"Recorder: " + Utf8ToWide(state.recording_status), state.recording_active ? RGB(109, 204, 163) : RGB(172, 187, 205));
+    if (!state.recording_output_utf8.empty())
+    {
+        draw_runtime_line(L"Output: " + Utf8ToWide(state.recording_output_utf8), RGB(140, 154, 173));
+    }
     draw_runtime_line(L"Hook: " + Utf8ToWide(state.hotpatch_hook_state), hook_color);
     draw_runtime_line(L"Broker: " + Utf8ToWide(state.hotpatch_broker_status), RGB(172, 187, 205));
     draw_runtime_line(L"Runtime: " + Utf8ToWide(state.hotpatch_dll_status), RGB(172, 187, 205));
@@ -2050,7 +2501,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Live Mode cycles through Suppress, Replace, and Passthrough with no SteamVR restart once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Use Play to start. Start Recording writes a timestamped .svrcap into the current session directory, or next to the current direct-path session if one is selected, and skips this tool's own virtual replay trackers. Record interval defaults to 10 ms for SteamVR Tracking 2.0 and can be changed here; desktop clicks cycle presets while the VR button opens a numeric keyboard. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Live Mode cycles through Suppress, Replace, and Passthrough with no SteamVR restart once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -2083,8 +2534,12 @@ void OverlayApp::Impl::RenderThumbnailOverlay()
         RECT{26, 146, 374, 178},
         RGB(218, 186, 97));
     state.thumbnail_canvas.DrawSmall(
+        TruncateMiddle(Utf8ToWide(state.recording_active ? "recording" : "recorder idle"), 28),
+        RECT{26, 172, 374, 204},
+        state.recording_active ? RGB(109, 204, 163) : RGB(172, 187, 205));
+    state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(Utf8ToWide(state.status_text.empty() ? "Idle" : state.status_text), 28),
-        RECT{26, 180, 374, 212},
+        RECT{26, 206, 374, 238},
         RGB(172, 187, 205));
     state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(
@@ -2093,12 +2548,12 @@ void OverlayApp::Impl::RenderThumbnailOverlay()
                 std::to_string(state.hotpatch_pose_updates_suppressed) + " / rep " +
                 std::to_string(state.hotpatch_pose_updates_replaced)),
             28),
-        RECT{26, 206, 374, 238},
+        RECT{26, 236, 374, 268},
         state.hotpatch_hook_state == "hook_installed" ? RGB(109, 204, 163) : RGB(172, 187, 205));
     state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(Utf8ToWide(
             state.loaded_session_utf8.empty() ? state.requested_session_utf8 : state.loaded_session_utf8), 28),
-        RECT{26, 250, 374, 320},
+        RECT{26, 278, 374, 344},
         RGB(213, 221, 231),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
 
@@ -2132,6 +2587,21 @@ void OverlayApp::Impl::AddButton(
     case ButtonAction::Play:
         fill = RGB(31, 94, 76);
         frame = RGB(109, 204, 163);
+        break;
+
+    case ButtonAction::StartRecording:
+        fill = RGB(87, 39, 53);
+        frame = RGB(236, 107, 132);
+        break;
+
+    case ButtonAction::StopRecording:
+        fill = RGB(82, 58, 33);
+        frame = RGB(218, 186, 97);
+        break;
+
+    case ButtonAction::EditRecordInterval:
+        fill = RGB(55, 57, 70);
+        frame = RGB(140, 154, 173);
         break;
 
     case ButtonAction::Pause:

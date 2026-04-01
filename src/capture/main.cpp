@@ -11,8 +11,12 @@
 #include <thread>
 #include <vector>
 
+#include <windows.h>
+#include <mmsystem.h>
+
 #include "capture/openvr_app_helpers.h"
 #include "openvr.h"
+#include "session/replay_settings.h"
 #include "session/session_format.h"
 
 namespace
@@ -24,8 +28,9 @@ struct Options
     std::filesystem::path pretty_print_path;
     std::filesystem::path pretty_print_csv_path;
     std::filesystem::path output_path;
+    std::wstring until_event_name;
     double duration_seconds = 10.0;
-    int interval_ms = 10;
+    double interval_ms = steamvr_capture::replay_settings::kDefaultRecordIntervalMs;
 };
 
 void PrintUsage()
@@ -33,7 +38,7 @@ void PrintUsage()
     std::cout
         << "Usage:\n"
         << "  steamvr_capture_recorder --list\n"
-        << "  steamvr_capture_recorder --record <file> [--duration <seconds>] [--interval-ms <ms>]\n"
+        << "  steamvr_capture_recorder --record <file> [--duration <seconds>] [--interval-ms <ms>] [--until-event <name>]\n"
         << "  steamvr_capture_recorder --pretty-print <file>\n"
         << "  steamvr_capture_recorder --pretty-print-csv <file> [--output <file>]\n";
 }
@@ -51,17 +56,26 @@ bool ParseDouble(const std::string& text, double* value)
     }
 }
 
-bool ParseInt(const std::string& text, int* value)
+std::wstring Utf8ToWide(const std::string& text)
 {
-    try
+    if (text.empty())
     {
-        *value = std::stoi(text);
-        return true;
+        return {};
     }
-    catch (...)
+
+    const int required = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (required <= 1)
     {
-        return false;
+        return {};
     }
+
+    std::wstring result(static_cast<std::size_t>(required), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, result.data(), required);
+    if (!result.empty() && result.back() == L'\0')
+    {
+        result.pop_back();
+    }
+    return result;
 }
 
 bool ParseOptions(const int argc, char** argv, Options* options)
@@ -131,10 +145,20 @@ bool ParseOptions(const int argc, char** argv, Options* options)
 
         if (arg == "--interval-ms")
         {
-            if (index + 1 >= argc || !ParseInt(argv[++index], &options->interval_ms))
+            if (index + 1 >= argc || !ParseDouble(argv[++index], &options->interval_ms))
             {
                 return false;
             }
+            continue;
+        }
+
+        if (arg == "--until-event")
+        {
+            if (index + 1 >= argc)
+            {
+                return false;
+            }
+            options->until_event_name = Utf8ToWide(argv[++index]);
             continue;
         }
 
@@ -162,7 +186,12 @@ bool ParseOptions(const int argc, char** argv, Options* options)
         return false;
     }
 
-    if (!options->record_path.empty() && (options->duration_seconds <= 0.0 || options->interval_ms <= 0))
+    if (!options->record_path.empty() && options->interval_ms <= 0.0)
+    {
+        return false;
+    }
+
+    if (!options->record_path.empty() && options->until_event_name.empty() && options->duration_seconds <= 0.0)
     {
         return false;
     }
@@ -638,11 +667,53 @@ int main(int argc, char** argv)
     }
 
     std::vector<vr::TrackedDevicePose_t> poses(vr::k_unMaxTrackedDeviceCount);
+    struct TimerResolutionGuard
+    {
+        TimerResolutionGuard()
+        {
+            enabled = timeBeginPeriod(1) == TIMERR_NOERROR;
+        }
+
+        ~TimerResolutionGuard()
+        {
+            if (enabled)
+            {
+                timeEndPeriod(1);
+            }
+        }
+
+        bool enabled = false;
+    } timer_resolution_guard;
+    (void)timer_resolution_guard;
+
     const auto start_time = std::chrono::steady_clock::now();
     const auto end_time = start_time + std::chrono::duration<double>(options.duration_seconds);
-
-    while (std::chrono::steady_clock::now() < end_time)
+    const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double, std::milli>(options.interval_ms));
+    auto next_sample_time = start_time;
+    HANDLE stop_event = nullptr;
+    if (!options.until_event_name.empty())
     {
+        stop_event = OpenEventW(SYNCHRONIZE, FALSE, options.until_event_name.c_str());
+        if (stop_event == nullptr)
+        {
+            std::cerr << "Failed to open stop event.\n";
+            return 1;
+        }
+    }
+
+    while (true)
+    {
+        if (stop_event != nullptr && WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0)
+        {
+            break;
+        }
+
+        if (stop_event == nullptr && std::chrono::steady_clock::now() >= end_time)
+        {
+            break;
+        }
+
         vr_system->GetDeviceToAbsoluteTrackingPose(
             vr::TrackingUniverseStanding,
             0.0f,
@@ -670,7 +741,21 @@ int main(int argc, char** argv)
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(options.interval_ms));
+        next_sample_time += interval;
+        const auto now_after_write = std::chrono::steady_clock::now();
+        if (next_sample_time > now_after_write)
+        {
+            std::this_thread::sleep_until(next_sample_time);
+        }
+        else
+        {
+            next_sample_time = now_after_write;
+        }
+    }
+
+    if (stop_event != nullptr)
+    {
+        CloseHandle(stop_event);
     }
 
     writer.Close();

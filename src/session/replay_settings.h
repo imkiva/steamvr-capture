@@ -2,6 +2,8 @@
 
 namespace steamvr_capture::replay_settings
 {
+constexpr float kDefaultRecordIntervalMs = 10.0f;
+
 constexpr char kDriverSection[] = "driver_steamvr_capture_replay";
 constexpr char kHotpatchSection[] = "steamvr_capture_hotpatch";
 constexpr char kOverlaySection[] = "overlay_steamvr_capture";
@@ -20,6 +22,7 @@ constexpr char kSuppressRealTrackersKey[] = "suppress_real_trackers";
 constexpr char kLiveModeKey[] = "live_mode";
 
 constexpr char kSessionRootKey[] = "session_root";
+constexpr char kRecordIntervalMsKey[] = "record_interval_ms";
 
 constexpr char kOverlayAppKey[] = "steamvr_capture.overlay";
 constexpr char kOverlayManifestFilename[] = "steamvr_capture_overlay.vrmanifest";

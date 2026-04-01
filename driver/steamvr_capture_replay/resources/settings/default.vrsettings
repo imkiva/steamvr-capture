@@ -12,7 +12,8 @@
     "last_error": ""
   },
   "overlay_steamvr_capture": {
-    "session_root": ""
+    "session_root": "",
+    "record_interval_ms": 10.0
   },
   "steamvr_capture_hotpatch": {
     "suppress_real_trackers": true,
