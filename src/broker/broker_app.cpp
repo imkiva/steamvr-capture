@@ -158,6 +158,10 @@ int BrokerApp::Run(const bool once)
     do
     {
         RefreshVrServerTarget();
+        if (openvr_initialized_ && target_pid_ != openvr_target_pid_)
+        {
+            ShutdownOpenVr();
+        }
 
         std::string error;
         if (!EnsureOpenVr(&error))
@@ -355,6 +359,7 @@ bool BrokerApp::EnsureOpenVr(std::string* error)
 
     (void)system;
     openvr_initialized_ = true;
+    openvr_target_pid_ = target_pid_;
     return true;
 }
 
@@ -365,6 +370,7 @@ void BrokerApp::ShutdownOpenVr()
         vr::VR_Shutdown();
         openvr_initialized_ = false;
     }
+    openvr_target_pid_ = 0u;
 }
 
 void BrokerApp::PollReplayState()

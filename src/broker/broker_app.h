@@ -47,6 +47,7 @@ private:
     hotpatch::SharedState* shared_state_ = nullptr;
     bool shared_state_read_only_ = false;
     bool openvr_initialized_ = false;
+    std::uint32_t openvr_target_pid_ = 0u;
     std::filesystem::path hotpatch_dll_path_;
     std::uint32_t target_pid_ = 0u;
     bool suppress_real_trackers_ = true;

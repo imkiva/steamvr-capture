@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "hotpatch_shared/hotpatch_protocol.h"
 #include "openvr.h"
 #include "session/replay_settings.h"
 
@@ -577,7 +578,15 @@ struct OverlayState
     std::string status_text = "Idle";
     std::string playback_state = "stopped";
     std::string last_error;
+    std::string hotpatch_broker_status = "Broker not connected.";
+    std::string hotpatch_dll_status = "Hotpatch not injected.";
+    std::string hotpatch_hook_state = "inactive";
     std::int32_t loaded_tracker_count = 0;
+    std::uint32_t hotpatch_target_pid = 0;
+    std::uint32_t hotpatch_injected_pid = 0;
+    std::uint32_t hotpatch_tracked_device_add_calls = 0;
+    std::uint32_t hotpatch_pose_updates_seen = 0;
+    std::uint32_t hotpatch_pose_updates_suppressed = 0;
     bool loop_enabled = true;
     bool suppress_real_trackers = true;
     std::chrono::steady_clock::time_point last_settings_refresh{};
@@ -586,6 +595,71 @@ struct OverlayState
     GdiCanvas main_canvas{kMainWidth, kMainHeight};
     GdiCanvas thumbnail_canvas{kThumbnailWidth, kThumbnailHeight};
 };
+
+struct HotpatchSnapshot
+{
+    bool available = false;
+    std::string broker_status = "Broker not connected.";
+    std::string dll_status = "Hotpatch not injected.";
+    std::string hook_state = "inactive";
+    std::uint32_t target_pid = 0;
+    std::uint32_t injected_pid = 0;
+    std::uint32_t tracked_device_add_calls = 0;
+    std::uint32_t pose_updates_seen = 0;
+    std::uint32_t pose_updates_suppressed = 0;
+};
+
+const char* HookStateLabel(const hotpatch::HookState state)
+{
+    switch (state)
+    {
+    case hotpatch::HookState::Inactive:
+        return "inactive";
+
+    case hotpatch::HookState::BrokerReady:
+        return "broker_ready";
+
+    case hotpatch::HookState::Injected:
+        return "injected";
+
+    case hotpatch::HookState::LighthouseLoaded:
+        return "bridge_ready";
+
+    case hotpatch::HookState::HookInstalled:
+        return "hook_installed";
+
+    case hotpatch::HookState::HookFailed:
+        return "hook_failed";
+    }
+
+    return "unknown";
+}
+
+bool CopyHotpatchSnapshot(const hotpatch::SharedState* shared_state, HotpatchSnapshot* snapshot)
+{
+    if (shared_state == nullptr || snapshot == nullptr)
+    {
+        return false;
+    }
+
+    const hotpatch::SharedState shared_copy = *shared_state;
+    if (shared_copy.magic != hotpatch::kProtocolMagic || shared_copy.version != hotpatch::kProtocolVersion ||
+        shared_copy.size != sizeof(hotpatch::SharedState))
+    {
+        return false;
+    }
+
+    snapshot->available = true;
+    snapshot->broker_status = WideToUtf8(shared_copy.broker_status_text);
+    snapshot->dll_status = WideToUtf8(shared_copy.dll_status_text);
+    snapshot->hook_state = HookStateLabel(static_cast<hotpatch::HookState>(shared_copy.hook_state));
+    snapshot->target_pid = shared_copy.target_pid;
+    snapshot->injected_pid = shared_copy.injected_pid;
+    snapshot->tracked_device_add_calls = shared_copy.tracked_device_add_calls;
+    snapshot->pose_updates_seen = shared_copy.pose_updates_seen;
+    snapshot->pose_updates_suppressed = shared_copy.pose_updates_suppressed;
+    return true;
+}
 }  // namespace
 
 bool InstallApplicationManifest(const std::filesystem::path& manifest_path, const bool enable_auto_launch, std::string* error)
@@ -623,6 +697,10 @@ struct OverlayApp::Impl
     void PumpWindowMessages();
     void RefreshSettings(bool force_rescan);
     void RescanSessionFiles();
+    bool EnsureHotpatchStateMapped();
+    void CloseHotpatchStateMapping();
+    HotpatchSnapshot ReadHotpatchSnapshot() const;
+    void UpdateHotpatchPlaybackHint(const char* playback_state);
     void PumpGlobalEvents();
     void PumpOverlayEvents(vr::VROverlayHandle_t overlay_handle);
     void HandleMouseButtonUp(LONG x, LONG y);
@@ -643,6 +721,9 @@ struct OverlayApp::Impl
 
     static LRESULT CALLBACK DesktopWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
     LRESULT HandleDesktopWindowMessage(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+
+    HANDLE hotpatch_mapping = nullptr;
+    const hotpatch::SharedState* hotpatch_shared_state = nullptr;
 };
 
 void GdiCanvas::DrawTextBox(const std::wstring& text, const RECT& rect, HFONT font, COLORREF color, UINT format)
@@ -765,6 +846,82 @@ void OverlayApp::Impl::DestroyDesktopWindow()
     }
 }
 
+bool OverlayApp::Impl::EnsureHotpatchStateMapped()
+{
+    if (hotpatch_shared_state != nullptr)
+    {
+        return true;
+    }
+
+    if (hotpatch_mapping == nullptr)
+    {
+        hotpatch_mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, hotpatch::kSharedStateMappingName);
+        if (hotpatch_mapping == nullptr)
+        {
+            return false;
+        }
+    }
+
+    hotpatch_shared_state = static_cast<const hotpatch::SharedState*>(
+        MapViewOfFile(hotpatch_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(hotpatch::SharedState)));
+    if (hotpatch_shared_state == nullptr)
+    {
+        CloseHandle(hotpatch_mapping);
+        hotpatch_mapping = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+void OverlayApp::Impl::CloseHotpatchStateMapping()
+{
+    if (hotpatch_shared_state != nullptr)
+    {
+        UnmapViewOfFile(hotpatch_shared_state);
+        hotpatch_shared_state = nullptr;
+    }
+
+    if (hotpatch_mapping != nullptr)
+    {
+        CloseHandle(hotpatch_mapping);
+        hotpatch_mapping = nullptr;
+    }
+}
+
+HotpatchSnapshot OverlayApp::Impl::ReadHotpatchSnapshot() const
+{
+    HotpatchSnapshot snapshot;
+    if (!CopyHotpatchSnapshot(hotpatch_shared_state, &snapshot))
+    {
+        return HotpatchSnapshot{};
+    }
+    return snapshot;
+}
+
+void OverlayApp::Impl::UpdateHotpatchPlaybackHint(const char* playback_state)
+{
+    if (playback_state == nullptr)
+    {
+        return;
+    }
+
+    if (!EnsureHotpatchStateMapped())
+    {
+        return;
+    }
+
+    auto* shared_state = const_cast<hotpatch::SharedState*>(hotpatch_shared_state);
+    if (shared_state == nullptr)
+    {
+        return;
+    }
+
+    const bool has_session = !state.loaded_session_utf8.empty() || !state.requested_session_utf8.empty();
+    const bool playback_active = has_session && ::strcmp(playback_state, "stopped") != 0;
+    shared_state->playback_active = playback_active ? 1u : 0u;
+}
+
 void OverlayApp::Impl::PumpWindowMessages()
 {
     MSG message{};
@@ -855,6 +1012,7 @@ bool OverlayApp::Impl::Init(std::string* error)
 
 void OverlayApp::Impl::Shutdown()
 {
+    CloseHotpatchStateMapping();
     DestroyDesktopWindow();
 
     if (vr::VROverlay() != nullptr)
@@ -991,6 +1149,66 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
         dirty = true;
     }
 
+    if (!EnsureHotpatchStateMapped())
+    {
+        CloseHotpatchStateMapping();
+    }
+    const HotpatchSnapshot hotpatch_snapshot = ReadHotpatchSnapshot();
+    const std::string hotpatch_broker_status = hotpatch_snapshot.available &&
+            !hotpatch_snapshot.broker_status.empty()
+        ? hotpatch_snapshot.broker_status
+        : "Broker not connected.";
+    if (hotpatch_broker_status != state.hotpatch_broker_status)
+    {
+        state.hotpatch_broker_status = hotpatch_broker_status;
+        dirty = true;
+    }
+
+    const std::string hotpatch_dll_status = hotpatch_snapshot.available && !hotpatch_snapshot.dll_status.empty()
+        ? hotpatch_snapshot.dll_status
+        : "Hotpatch not injected.";
+    if (hotpatch_dll_status != state.hotpatch_dll_status)
+    {
+        state.hotpatch_dll_status = hotpatch_dll_status;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.hook_state != state.hotpatch_hook_state)
+    {
+        state.hotpatch_hook_state = hotpatch_snapshot.hook_state;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.target_pid != state.hotpatch_target_pid)
+    {
+        state.hotpatch_target_pid = hotpatch_snapshot.target_pid;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.injected_pid != state.hotpatch_injected_pid)
+    {
+        state.hotpatch_injected_pid = hotpatch_snapshot.injected_pid;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.tracked_device_add_calls != state.hotpatch_tracked_device_add_calls)
+    {
+        state.hotpatch_tracked_device_add_calls = hotpatch_snapshot.tracked_device_add_calls;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.pose_updates_seen != state.hotpatch_pose_updates_seen)
+    {
+        state.hotpatch_pose_updates_seen = hotpatch_snapshot.pose_updates_seen;
+        dirty = true;
+    }
+
+    if (hotpatch_snapshot.pose_updates_suppressed != state.hotpatch_pose_updates_suppressed)
+    {
+        state.hotpatch_pose_updates_suppressed = hotpatch_snapshot.pose_updates_suppressed;
+        dirty = true;
+    }
+
     if (force_rescan || dirty)
     {
         RescanSessionFiles();
@@ -1114,7 +1332,7 @@ void OverlayApp::Impl::PumpOverlayEvents(const vr::VROverlayHandle_t overlay_han
             break;
 
         case vr::VREvent_OverlayClosed:
-            state.quit_requested = true;
+            state.dirty = true;
             break;
 
         default:
@@ -1470,6 +1688,7 @@ bool OverlayApp::Impl::PickSessionFileWithDialog()
 void OverlayApp::Impl::RequestPlaybackState(const char* state_name)
 {
     WriteSettingsString(replay_settings::kDriverSection, replay_settings::kPlaybackStateKey, state_name);
+    UpdateHotpatchPlaybackHint(state_name);
     state.playback_state = state_name;
     state.last_error.clear();
     state.dirty = true;
@@ -1521,6 +1740,7 @@ void OverlayApp::Impl::TriggerLoad(const std::filesystem::path& session_path)
 
     WriteSettingsBool(replay_settings::kDriverSection, replay_settings::kEnableKey, true);
     WriteSettingsString(replay_settings::kDriverSection, replay_settings::kPlaybackStateKey, "stopped");
+    UpdateHotpatchPlaybackHint("stopped");
     WriteSettingsString(replay_settings::kDriverSection, replay_settings::kSessionPathKey, normalized_path);
 
     const std::int32_t next_generation = ReadSettingsInt(
@@ -1607,20 +1827,49 @@ void OverlayApp::Impl::RenderMainOverlay()
         RECT{60, 444, 990, 460},
         RGB(172, 187, 205));
 
-    state.main_canvas.DrawBody(L"Driver Status", RECT{1060, 288, 1260, 318}, RGB(239, 244, 248));
-    state.main_canvas.DrawSmall(Utf8ToWide(state.status_text), RECT{1060, 316, 1540, 344}, RGB(109, 204, 163));
+    state.main_canvas.DrawBody(L"Live Runtime", RECT{1060, 288, 1260, 316}, RGB(239, 244, 248));
 
-    state.main_canvas.DrawBody(L"Playback State", RECT{1060, 352, 1260, 380}, RGB(239, 244, 248));
-    state.main_canvas.DrawSmall(Utf8ToWide(state.playback_state), RECT{1060, 380, 1540, 408}, RGB(218, 186, 97));
+    COLORREF hook_color = RGB(172, 187, 205);
+    if (state.hotpatch_hook_state == "hook_installed")
+    {
+        hook_color = RGB(109, 204, 163);
+    }
+    else if (state.hotpatch_hook_state == "hook_failed")
+    {
+        hook_color = RGB(236, 107, 102);
+    }
+    else if (state.hotpatch_hook_state != "inactive")
+    {
+        hook_color = RGB(218, 186, 97);
+    }
 
-    state.main_canvas.DrawBody(L"Loop", RECT{1060, 416, 1160, 444}, RGB(239, 244, 248));
-    state.main_canvas.DrawSmall(state.loop_enabled ? L"Enabled" : L"Disabled", RECT{1060, 444, 1220, 460}, RGB(172, 187, 205));
+    int runtime_line_top = 320;
+    const auto draw_runtime_line = [&](const std::wstring& text, const COLORREF color)
+    {
+        state.main_canvas.DrawSmall(
+            TruncateMiddle(text, 78),
+            RECT{1060, runtime_line_top, 1540, runtime_line_top + 22},
+            color);
+        runtime_line_top += 22;
+    };
 
-    state.main_canvas.DrawBody(L"Loaded Trackers", RECT{1240, 416, 1440, 444}, RGB(239, 244, 248));
-    state.main_canvas.DrawSmall(
-        Utf8ToWide(std::to_string(state.loaded_tracker_count)),
-        RECT{1240, 444, 1540, 460},
+    draw_runtime_line(L"Driver: " + Utf8ToWide(state.status_text), RGB(109, 204, 163));
+    draw_runtime_line(
+        L"Playback: " + Utf8ToWide(state.playback_state) + L" / " + (state.loop_enabled ? L"loop" : L"once") +
+            L" / trackers " + Utf8ToWide(std::to_string(state.loaded_tracker_count)),
+        RGB(218, 186, 97));
+    draw_runtime_line(L"Hook: " + Utf8ToWide(state.hotpatch_hook_state), hook_color);
+    draw_runtime_line(L"Broker: " + Utf8ToWide(state.hotpatch_broker_status), RGB(172, 187, 205));
+    draw_runtime_line(L"Runtime: " + Utf8ToWide(state.hotpatch_dll_status), RGB(172, 187, 205));
+    draw_runtime_line(
+        L"Pose updates: " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_seen)) +
+            L" / suppressed " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_suppressed)) +
+            L" / add calls " + Utf8ToWide(std::to_string(state.hotpatch_tracked_device_add_calls)),
         RGB(172, 187, 205));
+    draw_runtime_line(
+        L"PIDs: target " + Utf8ToWide(std::to_string(state.hotpatch_target_pid)) +
+            L" / injected " + Utf8ToWide(std::to_string(state.hotpatch_injected_pid)),
+        RGB(140, 154, 173));
 
     state.main_canvas.DrawBody(L"Last Error", RECT{40, 488, 220, 520}, RGB(239, 244, 248));
     state.main_canvas.DrawSmall(
@@ -1709,7 +1958,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Suppress Real is driven by the live hotpatch broker and injected DLL path, with no SteamVR restart required once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Use Play to start. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Suppress Real is driven by the live broker and injected DLL path, with no SteamVR restart required once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -1746,9 +1995,17 @@ void OverlayApp::Impl::RenderThumbnailOverlay()
         RECT{26, 180, 374, 212},
         RGB(172, 187, 205));
     state.thumbnail_canvas.DrawSmall(
+        TruncateMiddle(
+            Utf8ToWide(
+                std::string("hook ") + state.hotpatch_hook_state + " / sup " +
+                std::to_string(state.hotpatch_pose_updates_suppressed)),
+            28),
+        RECT{26, 206, 374, 238},
+        state.hotpatch_hook_state == "hook_installed" ? RGB(109, 204, 163) : RGB(172, 187, 205));
+    state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(Utf8ToWide(
             state.loaded_session_utf8.empty() ? state.requested_session_utf8 : state.loaded_session_utf8), 28),
-        RECT{26, 230, 374, 320},
+        RECT{26, 250, 374, 320},
         RGB(213, 221, 231),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
 

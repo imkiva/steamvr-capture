@@ -57,6 +57,7 @@ The project is intentionally split into two OpenVR layers:
 ## Shell Execution
 
 - When running PowerShell commands for this repo, always start PowerShell in `-NoProfile -NonInteractive` mode to avoid profile side effects and PSReadLine noise.
+- In Codex CLI command output, keep the displayed command to the `-Command` body only. Do not wrap commands in an explicit nested `pwsh.exe` prefix unless there is no other workable option.
 
 ## Current MVP Scope
 
