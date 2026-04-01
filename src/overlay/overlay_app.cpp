@@ -766,6 +766,7 @@ struct OverlayState
     std::string live_mode = "suppress";
     float record_interval_ms = replay_settings::kDefaultRecordIntervalMs;
     bool recording_active = false;
+    bool recording_stop_pending = false;
     std::string recording_output_utf8;
     std::string recording_status = "Recorder idle.";
     std::chrono::steady_clock::time_point last_settings_refresh{};
@@ -1280,6 +1281,7 @@ bool OverlayApp::Impl::StartRecording()
     recorder_process = process_info.hProcess;
     recorder_process_id = process_info.dwProcessId;
     state.recording_active = true;
+    state.recording_stop_pending = false;
     state.recording_output_utf8 = PathToUtf8(output_path);
     state.recording_status = "Recording at " + FormatRecordIntervalMs(state.record_interval_ms) +
         " ms to " + state.recording_output_utf8;
@@ -1291,45 +1293,35 @@ bool OverlayApp::Impl::StartRecording()
 
 void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
 {
+    (void)refresh_sessions;
+
+    if (recorder_process == nullptr)
+    {
+        if (recorder_stop_event != nullptr)
+        {
+            CloseHandle(recorder_stop_event);
+            recorder_stop_event = nullptr;
+        }
+        state.recording_active = false;
+        state.recording_stop_pending = false;
+        state.dirty = true;
+        return;
+    }
+
+    if (state.recording_stop_pending)
+    {
+        return;
+    }
+
     if (recorder_stop_event != nullptr)
     {
         SetEvent(recorder_stop_event);
     }
-
-    if (recorder_process != nullptr)
-    {
-        const DWORD wait_result = WaitForSingleObject(recorder_process, 5000);
-        if (wait_result == WAIT_TIMEOUT)
-        {
-            state.last_error = "Recorder is still shutting down. Please try again in a moment.";
-            state.dirty = true;
-            return;
-        }
-
-        CloseHandle(recorder_process);
-        recorder_process = nullptr;
-    }
-
-    if (recorder_stop_event != nullptr)
-    {
-        CloseHandle(recorder_stop_event);
-        recorder_stop_event = nullptr;
-    }
-
-    recorder_process_id = 0;
-    if (state.recording_active)
-    {
-        state.recording_active = false;
-        state.recording_status = state.recording_output_utf8.empty()
-            ? "Recorder idle."
-            : "Saved recording to " + state.recording_output_utf8;
-        state.status_text = "Recording complete";
-        state.dirty = true;
-        if (refresh_sessions)
-        {
-            RefreshSettings(true);
-        }
-    }
+    state.recording_stop_pending = true;
+    state.recording_status = "Stopping recorder...";
+    state.status_text = "Stopping recording";
+    state.last_error.clear();
+    state.dirty = true;
 }
 
 void OverlayApp::Impl::PollRecordingProcess()
@@ -1342,6 +1334,26 @@ void OverlayApp::Impl::PollRecordingProcess()
     const DWORD wait_result = WaitForSingleObject(recorder_process, 0);
     if (wait_result == WAIT_TIMEOUT)
     {
+        return;
+    }
+    if (wait_result == WAIT_FAILED)
+    {
+        state.last_error = "Failed to poll recorder process state.";
+        state.recording_status = state.last_error;
+        state.recording_active = false;
+        state.recording_stop_pending = false;
+        if (recorder_process != nullptr)
+        {
+            CloseHandle(recorder_process);
+            recorder_process = nullptr;
+        }
+        if (recorder_stop_event != nullptr)
+        {
+            CloseHandle(recorder_stop_event);
+            recorder_stop_event = nullptr;
+        }
+        recorder_process_id = 0;
+        state.dirty = true;
         return;
     }
 
@@ -1357,6 +1369,7 @@ void OverlayApp::Impl::PollRecordingProcess()
 
     recorder_process_id = 0;
     state.recording_active = false;
+    state.recording_stop_pending = false;
     state.recording_status = exit_code == 0
         ? "Saved recording to " + state.recording_output_utf8
         : "Recorder exited with code " + std::to_string(exit_code);
@@ -1458,7 +1471,24 @@ bool OverlayApp::Impl::Init(std::string* error)
 
 void OverlayApp::Impl::Shutdown()
 {
-    StopRecording(false);
+    if (recorder_stop_event != nullptr)
+    {
+        SetEvent(recorder_stop_event);
+    }
+    if (recorder_process != nullptr)
+    {
+        WaitForSingleObject(recorder_process, 5000);
+        CloseHandle(recorder_process);
+        recorder_process = nullptr;
+    }
+    if (recorder_stop_event != nullptr)
+    {
+        CloseHandle(recorder_stop_event);
+        recorder_stop_event = nullptr;
+    }
+    recorder_process_id = 0;
+    state.recording_active = false;
+    state.recording_stop_pending = false;
     CloseHotpatchStateMapping();
     DestroyDesktopWindow();
 
@@ -1740,15 +1770,22 @@ void OverlayApp::Impl::PumpGlobalEvents()
         return;
     }
 
+    const std::uint32_t current_pid = GetCurrentProcessId();
     vr::VREvent_t event{};
     while (vr::VRSystem()->PollNextEvent(&event, sizeof(event)))
     {
         switch (event.eventType)
         {
         case vr::VREvent_Quit:
+            if (event.data.process.pid == 0 || event.data.process.pid == current_pid ||
+                event.data.process.oldPid == current_pid)
+            {
+                vr::VRSystem()->AcknowledgeQuit_Exiting();
+                state.quit_requested = true;
+            }
+            break;
+
         case vr::VREvent_ProcessQuit:
-            vr::VRSystem()->AcknowledgeQuit_Exiting();
-            state.quit_requested = true;
             break;
 
         default:
@@ -2318,12 +2355,12 @@ void OverlayApp::Impl::RenderMainOverlay()
         RECT{720, 192, 930, 244},
         ButtonAction::StartRecording,
         0,
-        state.recording_active ? L"Recording..." : L"Start Rec");
+        state.recording_active ? (state.recording_stop_pending ? L"Stopping..." : L"Recording...") : L"Start Rec");
     AddButton(
         RECT{950, 192, 1160, 244},
         ButtonAction::StopRecording,
         0,
-        L"Stop Rec");
+        state.recording_stop_pending ? L"Stop Sent" : L"Stop Rec");
     AddButton(
         RECT{1180, 192, 1330, 244},
         ButtonAction::ToggleLoop,
