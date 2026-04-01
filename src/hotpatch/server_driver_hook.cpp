@@ -74,11 +74,6 @@ std::array<double, 3> RotateVector(
         ConjugateQuaternion(normalized_rotation));
     return {rotated.x, rotated.y, rotated.z};
 }
-
-std::array<double, 3> SubtractVectors(const std::array<double, 3>& lhs, const double rhs[3])
-{
-    return {lhs[0] - rhs[0], lhs[1] - rhs[1], lhs[2] - rhs[2]};
-}
 }  // namespace
 
 ServerDriverHook::~ServerDriverHook()
@@ -149,6 +144,14 @@ void ServerDriverHook::Uninstall()
     g_server_driver_hook = nullptr;
     tracked_device_wrappers_.clear();
     devices_by_index_.clear();
+    if (shared_state_ != nullptr)
+    {
+        shared_state_->observed_device_count = 0u;
+        for (std::size_t index = 0; index < kMaxObservedDevices; ++index)
+        {
+            shared_state_->observed_devices[index] = ObservedDeviceSlot{};
+        }
+    }
     shared_state_ = nullptr;
 }
 
@@ -327,15 +330,12 @@ bool ServerDriverHook::ResolveTargetDevice(
         return false;
     }
 
-    if (metadata.device_class != vr::TrackedDeviceClass_GenericTracker)
-    {
-        return false;
-    }
-
     const std::wstring target_serial = Utf8ToWide(metadata.serial);
     for (std::uint32_t serial_index = 0; serial_index < shared_state_->serial_count && serial_index < kMaxTrackedSerials; ++serial_index)
     {
-        if (_wcsicmp(shared_state_->serials[serial_index].serial, target_serial.c_str()) == 0)
+        if (_wcsicmp(shared_state_->serials[serial_index].serial, target_serial.c_str()) == 0 &&
+            (shared_state_->serials[serial_index].device_class == 0u ||
+                shared_state_->serials[serial_index].device_class == static_cast<std::uint32_t>(metadata.device_class)))
         {
             if (live_mode != nullptr)
             {
@@ -352,6 +352,95 @@ bool ServerDriverHook::ResolveTargetDevice(
     return false;
 }
 
+void ServerDriverHook::UpdateObservedDevicePose(const vr::TrackedDeviceIndex_t device_index, const vr::DriverPose_t& pose)
+{
+    if (shared_state_ == nullptr)
+    {
+        return;
+    }
+
+    DeviceMetadata metadata;
+    if (!TryGetDeviceMetadata(device_index, &metadata) || metadata.serial.empty())
+    {
+        return;
+    }
+
+    if (metadata.serial.rfind("svrcap_replay_slot_", 0) == 0)
+    {
+        return;
+    }
+
+    std::uint32_t slot_index = kMaxObservedDevices;
+    for (std::uint32_t index = 0; index < shared_state_->observed_device_count && index < kMaxObservedDevices; ++index)
+    {
+        if (shared_state_->observed_devices[index].present != 0u &&
+            _wcsicmp(shared_state_->observed_devices[index].serial, Utf8ToWide(metadata.serial).c_str()) == 0)
+        {
+            slot_index = index;
+            break;
+        }
+    }
+
+    if (slot_index >= kMaxObservedDevices)
+    {
+        slot_index = std::min(shared_state_->observed_device_count, static_cast<std::uint32_t>(kMaxObservedDevices - 1u));
+        if (shared_state_->observed_device_count < kMaxObservedDevices)
+        {
+            shared_state_->observed_device_count = slot_index + 1u;
+        }
+    }
+
+    ObservedDeviceSlot& observed = shared_state_->observed_devices[slot_index];
+    observed.present = 1u;
+    observed.device_index = device_index;
+    observed.device_class = static_cast<std::uint32_t>(metadata.device_class);
+    std::wmemset(observed.serial, 0, kMaxWideSerialCharacters);
+    const std::wstring wide_serial = Utf8ToWide(metadata.serial);
+    if (!wide_serial.empty())
+    {
+        const std::size_t copy_length = std::min<std::size_t>(kMaxWideSerialCharacters - 1u, wide_serial.size());
+        std::wmemcpy(observed.serial, wide_serial.c_str(), copy_length);
+        observed.serial[copy_length] = L'\0';
+    }
+
+    LivePoseSlot& live_pose = observed.pose;
+    live_pose = LivePoseSlot{};
+    live_pose.sample_present = 1u;
+    live_pose.device_connected = pose.deviceIsConnected ? 1u : 0u;
+    live_pose.pose_valid = pose.poseIsValid ? 1u : 0u;
+    live_pose.will_drift_in_yaw = pose.willDriftInYaw ? 1u : 0u;
+    live_pose.should_apply_head_model = pose.shouldApplyHeadModel ? 1u : 0u;
+    live_pose.tracking_result = static_cast<std::int32_t>(pose.result);
+    live_pose.pose_time_offset_s = pose.poseTimeOffset;
+    live_pose.position_m[0] = pose.vecPosition[0];
+    live_pose.position_m[1] = pose.vecPosition[1];
+    live_pose.position_m[2] = pose.vecPosition[2];
+    live_pose.rotation_wxyz[0] = pose.qRotation.w;
+    live_pose.rotation_wxyz[1] = pose.qRotation.x;
+    live_pose.rotation_wxyz[2] = pose.qRotation.y;
+    live_pose.rotation_wxyz[3] = pose.qRotation.z;
+    live_pose.linear_velocity_mps[0] = pose.vecVelocity[0];
+    live_pose.linear_velocity_mps[1] = pose.vecVelocity[1];
+    live_pose.linear_velocity_mps[2] = pose.vecVelocity[2];
+    live_pose.angular_velocity_rps[0] = pose.vecAngularVelocity[0];
+    live_pose.angular_velocity_rps[1] = pose.vecAngularVelocity[1];
+    live_pose.angular_velocity_rps[2] = pose.vecAngularVelocity[2];
+    live_pose.world_from_driver_rotation_wxyz[0] = pose.qWorldFromDriverRotation.w;
+    live_pose.world_from_driver_rotation_wxyz[1] = pose.qWorldFromDriverRotation.x;
+    live_pose.world_from_driver_rotation_wxyz[2] = pose.qWorldFromDriverRotation.y;
+    live_pose.world_from_driver_rotation_wxyz[3] = pose.qWorldFromDriverRotation.z;
+    live_pose.world_from_driver_translation_m[0] = pose.vecWorldFromDriverTranslation[0];
+    live_pose.world_from_driver_translation_m[1] = pose.vecWorldFromDriverTranslation[1];
+    live_pose.world_from_driver_translation_m[2] = pose.vecWorldFromDriverTranslation[2];
+    live_pose.driver_from_head_rotation_wxyz[0] = pose.qDriverFromHeadRotation.w;
+    live_pose.driver_from_head_rotation_wxyz[1] = pose.qDriverFromHeadRotation.x;
+    live_pose.driver_from_head_rotation_wxyz[2] = pose.qDriverFromHeadRotation.y;
+    live_pose.driver_from_head_rotation_wxyz[3] = pose.qDriverFromHeadRotation.z;
+    live_pose.driver_from_head_translation_m[0] = pose.vecDriverFromHeadTranslation[0];
+    live_pose.driver_from_head_translation_m[1] = pose.vecDriverFromHeadTranslation[1];
+    live_pose.driver_from_head_translation_m[2] = pose.vecDriverFromHeadTranslation[2];
+}
+
 vr::DriverPose_t ServerDriverHook::BuildDisconnectedPose() const
 {
     vr::DriverPose_t pose{};
@@ -366,70 +455,49 @@ vr::DriverPose_t ServerDriverHook::BuildDisconnectedPose() const
     return pose;
 }
 
-vr::DriverPose_t ServerDriverHook::BuildReplacedPose(
-    const LivePoseSlot& live_pose, const vr::DriverPose_t& reference_pose) const
+vr::DriverPose_t ServerDriverHook::BuildReplacedPose(const LivePoseSlot& live_pose) const
 {
     if (live_pose.sample_present == 0u)
     {
         return BuildDisconnectedPose();
     }
 
-    vr::DriverPose_t pose = reference_pose;
-    pose.poseTimeOffset = 0.0;
-    pose.qWorldFromDriverRotation = NormalizeQuaternion(reference_pose.qWorldFromDriverRotation);
-    if (std::abs(pose.qWorldFromDriverRotation.w) <= kQuaternionEpsilon &&
-        std::abs(pose.qWorldFromDriverRotation.x) <= kQuaternionEpsilon &&
-        std::abs(pose.qWorldFromDriverRotation.y) <= kQuaternionEpsilon &&
-        std::abs(pose.qWorldFromDriverRotation.z) <= kQuaternionEpsilon)
-    {
-        pose.qWorldFromDriverRotation = {1.0, 0.0, 0.0, 0.0};
-    }
-    pose.qDriverFromHeadRotation = NormalizeQuaternion(reference_pose.qDriverFromHeadRotation);
-    if (std::abs(pose.qDriverFromHeadRotation.w) <= kQuaternionEpsilon &&
-        std::abs(pose.qDriverFromHeadRotation.x) <= kQuaternionEpsilon &&
-        std::abs(pose.qDriverFromHeadRotation.y) <= kQuaternionEpsilon &&
-        std::abs(pose.qDriverFromHeadRotation.z) <= kQuaternionEpsilon)
-    {
-        pose.qDriverFromHeadRotation = {1.0, 0.0, 0.0, 0.0};
-    }
-
-    const vr::HmdQuaternion_t inverse_world_from_driver = ConjugateQuaternion(pose.qWorldFromDriverRotation);
-    const std::array<double, 3> world_position = {
-        live_pose.position_m[0],
-        live_pose.position_m[1],
-        live_pose.position_m[2]};
-    const std::array<double, 3> translated_position =
-        SubtractVectors(world_position, pose.vecWorldFromDriverTranslation);
-    const std::array<double, 3> local_position =
-        RotateVector(inverse_world_from_driver, translated_position);
-    const std::array<double, 3> local_velocity = RotateVector(
-        inverse_world_from_driver,
-        {live_pose.linear_velocity_mps[0], live_pose.linear_velocity_mps[1], live_pose.linear_velocity_mps[2]});
-    const std::array<double, 3> local_angular_velocity = RotateVector(
-        inverse_world_from_driver,
-        {live_pose.angular_velocity_rps[0], live_pose.angular_velocity_rps[1], live_pose.angular_velocity_rps[2]});
-    const vr::HmdQuaternion_t world_rotation = NormalizeQuaternion({
+    vr::DriverPose_t pose{};
+    pose.poseTimeOffset = live_pose.pose_time_offset_s;
+    pose.qRotation = NormalizeQuaternion({
         live_pose.rotation_wxyz[0],
         live_pose.rotation_wxyz[1],
         live_pose.rotation_wxyz[2],
         live_pose.rotation_wxyz[3]});
-    const vr::HmdQuaternion_t local_rotation =
-        NormalizeQuaternion(MultiplyQuaternion(inverse_world_from_driver, world_rotation));
-
-    pose.qRotation = local_rotation;
-    pose.vecPosition[0] = local_position[0];
-    pose.vecPosition[1] = local_position[1];
-    pose.vecPosition[2] = local_position[2];
-    pose.vecVelocity[0] = local_velocity[0];
-    pose.vecVelocity[1] = local_velocity[1];
-    pose.vecVelocity[2] = local_velocity[2];
-    pose.vecAngularVelocity[0] = local_angular_velocity[0];
-    pose.vecAngularVelocity[1] = local_angular_velocity[1];
-    pose.vecAngularVelocity[2] = local_angular_velocity[2];
+    pose.vecPosition[0] = live_pose.position_m[0];
+    pose.vecPosition[1] = live_pose.position_m[1];
+    pose.vecPosition[2] = live_pose.position_m[2];
+    pose.vecVelocity[0] = live_pose.linear_velocity_mps[0];
+    pose.vecVelocity[1] = live_pose.linear_velocity_mps[1];
+    pose.vecVelocity[2] = live_pose.linear_velocity_mps[2];
+    pose.vecAngularVelocity[0] = live_pose.angular_velocity_rps[0];
+    pose.vecAngularVelocity[1] = live_pose.angular_velocity_rps[1];
+    pose.vecAngularVelocity[2] = live_pose.angular_velocity_rps[2];
+    pose.qWorldFromDriverRotation = NormalizeQuaternion({
+        live_pose.world_from_driver_rotation_wxyz[0],
+        live_pose.world_from_driver_rotation_wxyz[1],
+        live_pose.world_from_driver_rotation_wxyz[2],
+        live_pose.world_from_driver_rotation_wxyz[3]});
+    pose.vecWorldFromDriverTranslation[0] = live_pose.world_from_driver_translation_m[0];
+    pose.vecWorldFromDriverTranslation[1] = live_pose.world_from_driver_translation_m[1];
+    pose.vecWorldFromDriverTranslation[2] = live_pose.world_from_driver_translation_m[2];
+    pose.qDriverFromHeadRotation = NormalizeQuaternion({
+        live_pose.driver_from_head_rotation_wxyz[0],
+        live_pose.driver_from_head_rotation_wxyz[1],
+        live_pose.driver_from_head_rotation_wxyz[2],
+        live_pose.driver_from_head_rotation_wxyz[3]});
+    pose.vecDriverFromHeadTranslation[0] = live_pose.driver_from_head_translation_m[0];
+    pose.vecDriverFromHeadTranslation[1] = live_pose.driver_from_head_translation_m[1];
+    pose.vecDriverFromHeadTranslation[2] = live_pose.driver_from_head_translation_m[2];
     pose.poseIsValid = live_pose.pose_valid != 0u;
     pose.deviceIsConnected = live_pose.device_connected != 0u;
-    pose.willDriftInYaw = false;
-    pose.shouldApplyHeadModel = false;
+    pose.willDriftInYaw = live_pose.will_drift_in_yaw != 0u;
+    pose.shouldApplyHeadModel = live_pose.should_apply_head_model != 0u;
     pose.result = static_cast<vr::ETrackingResult>(live_pose.tracking_result);
     return pose;
 }
@@ -478,6 +546,8 @@ void ServerDriverHook::HandleTrackedDevicePoseUpdated(
         ++shared_state_->pose_updates_seen;
     }
 
+    UpdateObservedDevicePose(which_device, pose);
+
     if (original_tracked_device_pose_updated_ == nullptr)
     {
         return;
@@ -493,8 +563,7 @@ void ServerDriverHook::HandleTrackedDevicePoseUpdated(
             {
                 ++shared_state_->pose_updates_replaced;
             }
-            const vr::DriverPose_t replacement_pose =
-                BuildReplacedPose(shared_state_->live_poses[slot_index], pose);
+            const vr::DriverPose_t replacement_pose = BuildReplacedPose(shared_state_->live_poses[slot_index]);
             original_tracked_device_pose_updated_(self, which_device, replacement_pose, pose_struct_size);
             return;
         }
@@ -594,13 +663,17 @@ vr::DriverPose_t ServerDriverHook::TrackedDeviceProxy::GetPose()
     const vr::DriverPose_t pose = inner_driver_->GetPose();
     if (owner_ != nullptr)
     {
+        owner_->UpdateObservedDevicePose(object_id_, pose);
+    }
+    if (owner_ != nullptr)
+    {
         LiveMode live_mode = LiveMode::Passthrough;
         std::uint32_t slot_index = 0u;
         if (owner_->ResolveTargetDevice(object_id_, &live_mode, &slot_index))
         {
             if (live_mode == LiveMode::Replace)
             {
-                return owner_->BuildReplacedPose(owner_->shared_state_->live_poses[slot_index], pose);
+                return owner_->BuildReplacedPose(owner_->shared_state_->live_poses[slot_index]);
             }
             return owner_->BuildDisconnectedPose();
         }

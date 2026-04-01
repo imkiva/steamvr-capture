@@ -42,9 +42,11 @@ private:
     bool ShouldPublishVirtualTrackers() const;
     static PlaybackState ParsePlaybackState(const std::string& value);
     static const char* PlaybackStateToString(PlaybackState value);
+    static bool IsTrackerDescriptor(const session::TrackerDescriptor& descriptor);
 
     session::SessionData session_;
     std::vector<std::unique_ptr<ReplayTrackerDevice>> tracker_devices_;
+    std::vector<std::size_t> tracker_device_session_indices_;
     std::chrono::steady_clock::time_point playback_started_at_{};
     std::chrono::steady_clock::time_point last_control_poll_at_{};
     std::uint64_t playback_base_timestamp_ns_ = 0;

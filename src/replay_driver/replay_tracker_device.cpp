@@ -120,15 +120,21 @@ void ReplayTrackerDevice::ApplyPropertiesLocked()
         ? descriptor_->model_number
         : "SteamVR Capture Replay Tracker";
 
-    const std::string render_model = descriptor_.has_value() && !descriptor_->tracking_system.empty()
+    const std::string tracking_system = descriptor_.has_value() && !descriptor_->tracking_system.empty()
         ? descriptor_->tracking_system
         : "steamvr-capture";
+    const std::string manufacturer = descriptor_.has_value() && !descriptor_->manufacturer_name.empty()
+        ? descriptor_->manufacturer_name
+        : kManufacturerName;
+    const std::string controller_type = descriptor_.has_value() && !descriptor_->controller_type.empty()
+        ? descriptor_->controller_type
+        : kControllerType;
 
     vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_ModelNumber_String, model_number.c_str());
     vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_SerialNumber_String, serial_number_.c_str());
-    vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_ManufacturerName_String, kManufacturerName);
-    vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_ControllerType_String, kControllerType);
-    vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_TrackingSystemName_String, render_model.c_str());
+    vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_ManufacturerName_String, manufacturer.c_str());
+    vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_ControllerType_String, controller_type.c_str());
+    vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_TrackingSystemName_String, tracking_system.c_str());
     vr::VRProperties()->SetStringProperty(property_container_, vr::Prop_InputProfilePath_String, kInputProfilePath);
     vr::VRProperties()->SetBoolProperty(property_container_, vr::Prop_DeviceProvidesBatteryStatus_Bool, false);
 
@@ -168,6 +174,7 @@ vr::DriverPose_t ReplayTrackerDevice::ToDriverPose(const std::optional<session::
         return pose;
     }
 
+    pose.poseTimeOffset = sample->pose_time_offset_s;
     pose.qRotation.w = sample->rotation_wxyz[0];
     pose.qRotation.x = sample->rotation_wxyz[1];
     pose.qRotation.y = sample->rotation_wxyz[2];
@@ -181,9 +188,25 @@ vr::DriverPose_t ReplayTrackerDevice::ToDriverPose(const std::optional<session::
     pose.vecAngularVelocity[0] = sample->angular_velocity_rps[0];
     pose.vecAngularVelocity[1] = sample->angular_velocity_rps[1];
     pose.vecAngularVelocity[2] = sample->angular_velocity_rps[2];
+    pose.qWorldFromDriverRotation.w = sample->world_from_driver_rotation_wxyz[0];
+    pose.qWorldFromDriverRotation.x = sample->world_from_driver_rotation_wxyz[1];
+    pose.qWorldFromDriverRotation.y = sample->world_from_driver_rotation_wxyz[2];
+    pose.qWorldFromDriverRotation.z = sample->world_from_driver_rotation_wxyz[3];
+    pose.vecWorldFromDriverTranslation[0] = sample->world_from_driver_translation_m[0];
+    pose.vecWorldFromDriverTranslation[1] = sample->world_from_driver_translation_m[1];
+    pose.vecWorldFromDriverTranslation[2] = sample->world_from_driver_translation_m[2];
+    pose.qDriverFromHeadRotation.w = sample->driver_from_head_rotation_wxyz[0];
+    pose.qDriverFromHeadRotation.x = sample->driver_from_head_rotation_wxyz[1];
+    pose.qDriverFromHeadRotation.y = sample->driver_from_head_rotation_wxyz[2];
+    pose.qDriverFromHeadRotation.z = sample->driver_from_head_rotation_wxyz[3];
+    pose.vecDriverFromHeadTranslation[0] = sample->driver_from_head_translation_m[0];
+    pose.vecDriverFromHeadTranslation[1] = sample->driver_from_head_translation_m[1];
+    pose.vecDriverFromHeadTranslation[2] = sample->driver_from_head_translation_m[2];
     pose.poseIsValid = sample->pose_valid;
     pose.deviceIsConnected = sample->device_connected;
     pose.result = static_cast<vr::ETrackingResult>(sample->tracking_result);
+    pose.willDriftInYaw = sample->will_drift_in_yaw;
+    pose.shouldApplyHeadModel = sample->should_apply_head_model;
     return pose;
 }
 }  // namespace steamvr_capture::replay

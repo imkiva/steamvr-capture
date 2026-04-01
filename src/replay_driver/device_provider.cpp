@@ -10,6 +10,8 @@ namespace steamvr_capture::replay
 {
 namespace
 {
+constexpr std::int32_t kGenericTrackerClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_GenericTracker);
+
 std::string ReadSettingsString(const char* section, const char* key)
 {
     char buffer[4096] = {};
@@ -84,15 +86,17 @@ void DeviceProvider::RunFrame()
 
     AdvancePlayback(std::chrono::steady_clock::now());
 
-    if (!session_.trackers.empty())
+    if (!tracker_device_session_indices_.empty())
     {
         for (std::size_t tracker_index = 0; tracker_index < tracker_devices_.size(); ++tracker_index)
         {
-            if (tracker_index >= session_.trackers.size())
+            if (tracker_index >= tracker_device_session_indices_.size())
             {
                 tracker_devices_[tracker_index]->SetDisconnected();
                 continue;
             }
+
+            const std::size_t session_index = tracker_device_session_indices_[tracker_index];
 
             if (!ShouldPublishVirtualTrackers())
             {
@@ -100,7 +104,7 @@ void DeviceProvider::RunFrame()
                 continue;
             }
 
-            const auto sample = session::SampleAtOrBefore(session_, tracker_index, playback_timestamp_ns_);
+            const auto sample = session::SampleAtOrBefore(session_, session_index, playback_timestamp_ns_);
             if (sample.has_value())
             {
                 tracker_devices_[tracker_index]->UpdateSample(*sample);
@@ -136,6 +140,7 @@ void DeviceProvider::Cleanup()
 {
     session_ = {};
     tracker_devices_.clear();
+    tracker_device_session_indices_.clear();
     playback_base_timestamp_ns_ = 0;
     playback_timestamp_ns_ = 0;
     playback_state_ = PlaybackState::Stopped;
@@ -241,18 +246,29 @@ bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, cons
         return false;
     }
 
-    EnsureTrackerCapacity(loaded_session.trackers.size());
+    std::vector<std::size_t> tracker_session_indices;
+    tracker_session_indices.reserve(loaded_session.trackers.size());
+    for (std::size_t index = 0; index < loaded_session.trackers.size(); ++index)
+    {
+        if (IsTrackerDescriptor(loaded_session.trackers[index]))
+        {
+            tracker_session_indices.push_back(index);
+        }
+    }
+
+    EnsureTrackerCapacity(tracker_session_indices.size());
 
     session_ = std::move(loaded_session);
+    tracker_device_session_indices_ = std::move(tracker_session_indices);
     loaded_session_path_ = session_path;
     playback_state_ = PlaybackState::Stopped;
     requested_playback_state_ = PlaybackStateToString(playback_state_);
 
     for (std::size_t index = 0; index < tracker_devices_.size(); ++index)
     {
-        if (index < session_.trackers.size())
+        if (index < tracker_device_session_indices_.size())
         {
-            tracker_devices_[index]->UpdateDescriptor(session_.trackers[index]);
+            tracker_devices_[index]->UpdateDescriptor(session_.trackers[tracker_device_session_indices_[index]]);
         }
         else
         {
@@ -264,7 +280,11 @@ bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, cons
     WriteRuntimeStatus("Loaded session", "");
     WriteLoadedSessionMetadata();
     WritePlaybackStateSetting();
-    DriverLog("Loaded session %s with %zu tracker(s)", session_path.c_str(), session_.trackers.size());
+    DriverLog(
+        "Loaded session %s with %zu device(s), %zu replay tracker(s)",
+        session_path.c_str(),
+        session_.trackers.size(),
+        tracker_device_session_indices_.size());
     return true;
 }
 
@@ -415,6 +435,11 @@ void DeviceProvider::WritePlaybackStateSetting()
 bool DeviceProvider::ShouldPublishVirtualTrackers() const
 {
     return live_mode_ != "replace";
+}
+
+bool DeviceProvider::IsTrackerDescriptor(const session::TrackerDescriptor& descriptor)
+{
+    return descriptor.device_class == 0 || descriptor.device_class == kGenericTrackerClass;
 }
 
 DeviceProvider::PlaybackState DeviceProvider::ParsePlaybackState(const std::string& value)

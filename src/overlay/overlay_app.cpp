@@ -370,6 +370,11 @@ std::string FormatRecordIntervalMs(const float value)
     return stream.str();
 }
 
+std::string NormalizeRecordState(const std::string& record_state)
+{
+    return record_state == "recording" ? "recording" : "stopped";
+}
+
 float NextRecordIntervalPresetMs(const float current_value)
 {
     const float normalized = NormalizeRecordIntervalMs(current_value);
@@ -766,6 +771,7 @@ struct OverlayState
     std::string live_mode = "suppress";
     float record_interval_ms = replay_settings::kDefaultRecordIntervalMs;
     bool recording_active = false;
+    bool recording_start_pending = false;
     bool recording_stop_pending = false;
     std::string recording_output_utf8;
     std::string recording_status = "Recorder idle.";
@@ -782,6 +788,11 @@ struct HotpatchSnapshot
     std::string broker_status = "Broker not connected.";
     std::string dll_status = "Hotpatch not injected.";
     std::string hook_state = "inactive";
+    bool recording_active = false;
+    std::string recording_status = "Recorder idle.";
+    std::string recording_output_utf8;
+    std::uint32_t recording_device_count = 0;
+    std::uint64_t recorded_sample_count = 0;
     std::uint32_t target_pid = 0;
     std::uint32_t injected_pid = 0;
     std::uint32_t tracked_device_add_calls = 0;
@@ -876,6 +887,11 @@ bool CopyHotpatchSnapshot(const hotpatch::SharedState* shared_state, HotpatchSna
     snapshot->broker_status = WideToUtf8(shared_copy.broker_status_text);
     snapshot->dll_status = WideToUtf8(shared_copy.dll_status_text);
     snapshot->hook_state = HookStateLabel(static_cast<hotpatch::HookState>(shared_copy.hook_state));
+    snapshot->recording_active = shared_copy.recording_active != 0u;
+    snapshot->recording_status = WideToUtf8(shared_copy.recording_status_text);
+    snapshot->recording_output_utf8 = WideToUtf8(shared_copy.recording_output_path);
+    snapshot->recording_device_count = shared_copy.recording_device_count;
+    snapshot->recorded_sample_count = shared_copy.recorded_sample_count;
     snapshot->target_pid = shared_copy.target_pid;
     snapshot->injected_pid = shared_copy.injected_pid;
     snapshot->tracked_device_add_calls = shared_copy.tracked_device_add_calls;
@@ -1233,12 +1249,11 @@ std::filesystem::path OverlayApp::Impl::ResolveRecordingDirectory() const
 
 bool OverlayApp::Impl::StartRecording()
 {
-    if (state.recording_active)
+    if (state.recording_active || state.recording_start_pending)
     {
         return true;
     }
 
-    const std::filesystem::path recorder_path = state.exe_path.parent_path() / L"steamvr_capture_recorder.exe";
     const std::filesystem::path recording_directory = ResolveRecordingDirectory();
     std::error_code filesystem_error;
     std::filesystem::create_directories(recording_directory, filesystem_error);
@@ -1250,41 +1265,16 @@ bool OverlayApp::Impl::StartRecording()
     }
 
     const std::filesystem::path output_path = BuildRecordingFilename(recording_directory);
-    const std::wstring stop_event_name = MakeRecorderStopEventName();
-    const std::wstring interval_ms = Utf8ToWide(FormatRecordIntervalMs(state.record_interval_ms));
-    recorder_stop_event = CreateEventW(nullptr, TRUE, FALSE, stop_event_name.c_str());
-    if (recorder_stop_event == nullptr)
-    {
-        state.last_error = "Failed to create recorder stop event.";
-        state.dirty = true;
-        return false;
-    }
-
-    PROCESS_INFORMATION process_info{};
-    std::string launch_error;
-    const bool started = LaunchHiddenProcess(
-        recorder_path,
-        {L"--record", output_path.wstring(), L"--until-event", stop_event_name, L"--interval-ms", interval_ms},
-        state.exe_path.parent_path(),
-        &process_info,
-        &launch_error);
-    if (!started)
-    {
-        CloseHandle(recorder_stop_event);
-        recorder_stop_event = nullptr;
-        state.last_error = launch_error;
-        state.dirty = true;
-        return false;
-    }
-
-    CloseHandle(process_info.hThread);
-    recorder_process = process_info.hProcess;
-    recorder_process_id = process_info.dwProcessId;
-    state.recording_active = true;
+    WriteSettingsString(
+        replay_settings::kOverlaySection,
+        replay_settings::kRecordOutputPathKey,
+        PathToUtf8(output_path));
+    WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "recording");
+    state.recording_active = false;
+    state.recording_start_pending = true;
     state.recording_stop_pending = false;
     state.recording_output_utf8 = PathToUtf8(output_path);
-    state.recording_status = "Recording at " + FormatRecordIntervalMs(state.record_interval_ms) +
-        " ms to " + state.recording_output_utf8;
+    state.recording_status = "Starting driver-pose recording to " + state.recording_output_utf8;
     state.status_text = "Recording session";
     state.last_error.clear();
     state.dirty = true;
@@ -1295,16 +1285,8 @@ void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
 {
     (void)refresh_sessions;
 
-    if (recorder_process == nullptr)
+    if (!state.recording_active && !state.recording_start_pending)
     {
-        if (recorder_stop_event != nullptr)
-        {
-            CloseHandle(recorder_stop_event);
-            recorder_stop_event = nullptr;
-        }
-        state.recording_active = false;
-        state.recording_stop_pending = false;
-        state.dirty = true;
         return;
     }
 
@@ -1313,12 +1295,10 @@ void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
         return;
     }
 
-    if (recorder_stop_event != nullptr)
-    {
-        SetEvent(recorder_stop_event);
-    }
+    WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "stopped");
+    state.recording_start_pending = false;
     state.recording_stop_pending = true;
-    state.recording_status = "Stopping recorder...";
+    state.recording_status = "Stopping driver-pose recording...";
     state.status_text = "Stopping recording";
     state.last_error.clear();
     state.dirty = true;
@@ -1326,59 +1306,66 @@ void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
 
 void OverlayApp::Impl::PollRecordingProcess()
 {
-    if (recorder_process == nullptr)
+    const HotpatchSnapshot snapshot = ReadHotpatchSnapshot();
+    if (!snapshot.available)
     {
         return;
     }
 
-    const DWORD wait_result = WaitForSingleObject(recorder_process, 0);
-    if (wait_result == WAIT_TIMEOUT)
+    const std::string record_state = NormalizeRecordState(
+        ReadSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey));
+    const bool recording_active = snapshot.recording_active;
+    if (recording_active)
     {
-        return;
+        if (!state.recording_active || state.recording_start_pending || state.recording_stop_pending)
+        {
+            state.recording_active = true;
+            state.recording_start_pending = false;
+            state.recording_stop_pending = false;
+            state.dirty = true;
+        }
     }
-    if (wait_result == WAIT_FAILED)
+    else
     {
-        state.last_error = "Failed to poll recorder process state.";
-        state.recording_status = state.last_error;
-        state.recording_active = false;
-        state.recording_stop_pending = false;
-        if (recorder_process != nullptr)
+        if (state.recording_active)
         {
-            CloseHandle(recorder_process);
-            recorder_process = nullptr;
+            state.recording_active = false;
+            state.recording_stop_pending = false;
+            state.dirty = true;
         }
-        if (recorder_stop_event != nullptr)
+
+        if (state.recording_start_pending && record_state == "stopped")
         {
-            CloseHandle(recorder_stop_event);
-            recorder_stop_event = nullptr;
+            state.recording_start_pending = false;
+            state.dirty = true;
         }
-        recorder_process_id = 0;
+
+        if (state.recording_stop_pending && record_state == "stopped")
+        {
+            state.recording_stop_pending = false;
+            state.dirty = true;
+        }
+    }
+
+    if (!snapshot.recording_output_utf8.empty() && snapshot.recording_output_utf8 != state.recording_output_utf8)
+    {
+        state.recording_output_utf8 = snapshot.recording_output_utf8;
         state.dirty = true;
-        return;
     }
 
-    DWORD exit_code = 0;
-    GetExitCodeProcess(recorder_process, &exit_code);
-    CloseHandle(recorder_process);
-    recorder_process = nullptr;
-    if (recorder_stop_event != nullptr)
+    std::string recording_status = snapshot.recording_status.empty()
+        ? (state.recording_active ? "Recording..." : "Recorder idle.")
+        : snapshot.recording_status;
+    if (state.recording_start_pending && !recording_active &&
+        (recording_status.empty() || recording_status == "Recorder idle."))
     {
-        CloseHandle(recorder_stop_event);
-        recorder_stop_event = nullptr;
+        recording_status = "Starting driver-pose recording...";
     }
-
-    recorder_process_id = 0;
-    state.recording_active = false;
-    state.recording_stop_pending = false;
-    state.recording_status = exit_code == 0
-        ? "Saved recording to " + state.recording_output_utf8
-        : "Recorder exited with code " + std::to_string(exit_code);
-    if (exit_code != 0)
+    if (recording_status != state.recording_status)
     {
-        state.last_error = state.recording_status;
+        state.recording_status = recording_status;
+        state.dirty = true;
     }
-    RefreshSettings(true);
-    state.dirty = true;
 }
 
 void OverlayApp::Impl::PumpWindowMessages()
@@ -1475,19 +1462,8 @@ void OverlayApp::Impl::Shutdown()
     {
         SetEvent(recorder_stop_event);
     }
-    if (recorder_process != nullptr)
-    {
-        WaitForSingleObject(recorder_process, 5000);
-        CloseHandle(recorder_process);
-        recorder_process = nullptr;
-    }
-    if (recorder_stop_event != nullptr)
-    {
-        CloseHandle(recorder_stop_event);
-        recorder_stop_event = nullptr;
-    }
-    recorder_process_id = 0;
     state.recording_active = false;
+    state.recording_start_pending = false;
     state.recording_stop_pending = false;
     CloseHotpatchStateMapping();
     DestroyDesktopWindow();
@@ -2355,7 +2331,8 @@ void OverlayApp::Impl::RenderMainOverlay()
         RECT{720, 192, 930, 244},
         ButtonAction::StartRecording,
         0,
-        state.recording_active ? (state.recording_stop_pending ? L"Stopping..." : L"Recording...") : L"Start Rec");
+        state.recording_start_pending ? L"Starting..." :
+            (state.recording_active ? (state.recording_stop_pending ? L"Stopping..." : L"Recording...") : L"Start Rec"));
     AddButton(
         RECT{950, 192, 1160, 244},
         ButtonAction::StopRecording,
@@ -2432,7 +2409,9 @@ void OverlayApp::Impl::RenderMainOverlay()
         L"Record interval: " + Utf8ToWide(FormatRecordIntervalMs(state.record_interval_ms)) + L" ms",
         RGB(133, 187, 237));
     draw_runtime_line(L"Mode: " + LiveModeLabel(state.live_mode), RGB(133, 187, 237));
-    draw_runtime_line(L"Recorder: " + Utf8ToWide(state.recording_status), state.recording_active ? RGB(109, 204, 163) : RGB(172, 187, 205));
+    draw_runtime_line(
+        L"Recorder: " + Utf8ToWide(state.recording_status),
+        (state.recording_active || state.recording_start_pending) ? RGB(109, 204, 163) : RGB(172, 187, 205));
     if (!state.recording_output_utf8.empty())
     {
         draw_runtime_line(L"Output: " + Utf8ToWide(state.recording_output_utf8), RGB(140, 154, 173));
@@ -2538,7 +2517,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Start Recording writes a timestamped .svrcap into the current session directory, or next to the current direct-path session if one is selected, and skips this tool's own virtual replay trackers. Record interval defaults to 10 ms for SteamVR Tracking 2.0 and can be changed here; desktop clicks cycle presets while the VR button opens a numeric keyboard. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Live Mode cycles through Suppress, Replace, and Passthrough with no SteamVR restart once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Use Play to start. Start Recording now asks the broker and live hotpatch to record full driver-pose samples for active HMD, controller, and tracker devices into a timestamped .svrcap in the current session directory, or next to the current direct-path session if one is selected, while skipping this tool's own replay devices. Record interval defaults to 10 ms for SteamVR Tracking 2.0 and can be changed here; desktop clicks cycle presets while the VR button opens a numeric keyboard. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Live Mode cycles through Suppress, Replace, and Passthrough with no SteamVR restart once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -2571,9 +2550,11 @@ void OverlayApp::Impl::RenderThumbnailOverlay()
         RECT{26, 146, 374, 178},
         RGB(218, 186, 97));
     state.thumbnail_canvas.DrawSmall(
-        TruncateMiddle(Utf8ToWide(state.recording_active ? "recording" : "recorder idle"), 28),
+        TruncateMiddle(
+            Utf8ToWide(state.recording_start_pending ? "starting" : (state.recording_active ? "recording" : "recorder idle")),
+            28),
         RECT{26, 172, 374, 204},
-        state.recording_active ? RGB(109, 204, 163) : RGB(172, 187, 205));
+        (state.recording_active || state.recording_start_pending) ? RGB(109, 204, 163) : RGB(172, 187, 205));
     state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(Utf8ToWide(state.status_text.empty() ? "Idle" : state.status_text), 28),
         RECT{26, 206, 374, 238},

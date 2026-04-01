@@ -55,6 +55,20 @@ std::string GetTrackerRole(
     return buffer;
 }
 
+std::string GetControllerRole(vr::IVRSystem& vr_system, const std::uint32_t device_index)
+{
+    const vr::ETrackedControllerRole role = vr_system.GetControllerRoleForTrackedDeviceIndex(device_index);
+    switch (role)
+    {
+    case vr::TrackedControllerRole_LeftHand:
+        return "left_hand";
+    case vr::TrackedControllerRole_RightHand:
+        return "right_hand";
+    default:
+        return {};
+    }
+}
+
 void NormalizeQuaternion(std::array<double, 4>* quaternion)
 {
     const double length = std::sqrt(
@@ -125,6 +139,14 @@ std::array<double, 4> QuaternionFromMatrix(const vr::HmdMatrix34_t& matrix)
     return quaternion;
 }
 
+std::array<double, 12> Matrix34ToArray(const vr::HmdMatrix34_t& matrix)
+{
+    return {
+        matrix.m[0][0], matrix.m[0][1], matrix.m[0][2], matrix.m[0][3],
+        matrix.m[1][0], matrix.m[1][1], matrix.m[1][2], matrix.m[1][3],
+        matrix.m[2][0], matrix.m[2][1], matrix.m[2][2], matrix.m[2][3]};
+}
+
 bool IsReplayVirtualTracker(
     vr::IVRSystem& vr_system,
     const std::uint32_t device_index,
@@ -146,20 +168,38 @@ bool IsReplayVirtualTracker(
         GetTrackedDeviceString(vr_system, device_index, vr::Prop_ControllerType_String);
     return controller_type == kReplayControllerType;
 }
-}  // namespace
 
-std::vector<TrackerSnapshot> EnumerateTrackers(vr::IVRSystem& vr_system, vr::IVRSettings& settings)
+bool IsRecordableClass(const vr::ETrackedDeviceClass device_class)
+{
+    return device_class == vr::TrackedDeviceClass_GenericTracker ||
+        device_class == vr::TrackedDeviceClass_Controller ||
+        device_class == vr::TrackedDeviceClass_HMD;
+}
+
+std::vector<TrackerSnapshot> EnumerateDevices(
+    vr::IVRSystem& vr_system,
+    vr::IVRSettings& settings,
+    const bool trackers_only)
 {
     std::vector<TrackerSnapshot> trackers;
     for (std::uint32_t device_index = 0; device_index < vr::k_unMaxTrackedDeviceCount; ++device_index)
     {
-        if (vr_system.GetTrackedDeviceClass(device_index) != vr::TrackedDeviceClass_GenericTracker)
+        const vr::ETrackedDeviceClass device_class = vr_system.GetTrackedDeviceClass(device_index);
+        if (trackers_only)
+        {
+            if (device_class != vr::TrackedDeviceClass_GenericTracker)
+            {
+                continue;
+            }
+        }
+        else if (!IsRecordableClass(device_class))
         {
             continue;
         }
 
         TrackerSnapshot tracker;
         tracker.device_index = device_index;
+        tracker.descriptor.device_class = static_cast<std::int32_t>(device_class);
         tracker.descriptor.serial =
             GetTrackedDeviceString(vr_system, device_index, vr::Prop_SerialNumber_String);
         if (IsReplayVirtualTracker(vr_system, device_index, tracker.descriptor.serial))
@@ -170,11 +210,44 @@ std::vector<TrackerSnapshot> EnumerateTrackers(vr::IVRSystem& vr_system, vr::IVR
             GetTrackedDeviceString(vr_system, device_index, vr::Prop_TrackingSystemName_String);
         tracker.descriptor.model_number =
             GetTrackedDeviceString(vr_system, device_index, vr::Prop_ModelNumber_String);
-        tracker.descriptor.role =
-            GetTrackerRole(settings, tracker.descriptor.tracking_system, tracker.descriptor.serial);
+        tracker.descriptor.manufacturer_name =
+            GetTrackedDeviceString(vr_system, device_index, vr::Prop_ManufacturerName_String);
+        tracker.descriptor.controller_type =
+            GetTrackedDeviceString(vr_system, device_index, vr::Prop_ControllerType_String);
+        if (device_class == vr::TrackedDeviceClass_GenericTracker)
+        {
+            tracker.descriptor.role =
+                GetTrackerRole(settings, tracker.descriptor.tracking_system, tracker.descriptor.serial);
+        }
+        else if (device_class == vr::TrackedDeviceClass_Controller)
+        {
+            tracker.descriptor.role = GetControllerRole(vr_system, device_index);
+        }
         trackers.push_back(std::move(tracker));
     }
     return trackers;
+}
+}  // namespace
+
+std::vector<TrackerSnapshot> EnumerateTrackers(vr::IVRSystem& vr_system, vr::IVRSettings& settings)
+{
+    return EnumerateDevices(vr_system, settings, true);
+}
+
+std::vector<TrackerSnapshot> EnumerateRecordableDevices(vr::IVRSystem& vr_system, vr::IVRSettings& settings)
+{
+    return EnumerateDevices(vr_system, settings, false);
+}
+
+session::TrackingSpaceSnapshot CaptureTrackingSpaceSnapshot(vr::IVRSystem& vr_system)
+{
+    session::TrackingSpaceSnapshot snapshot;
+    snapshot.has_raw_to_standing = true;
+    snapshot.raw_to_standing = Matrix34ToArray(vr_system.GetRawZeroPoseToStandingAbsoluteTrackingPose());
+    // Mixed-runtime setups can report a valid IVRSystem but still fault on the seated transform query.
+    // Keep the field optional so recording remains usable; raw->standing is the transform replay needs today.
+    snapshot.has_seated_to_standing = false;
+    return snapshot;
 }
 
 bool PopulateSampleFromPose(
@@ -196,9 +269,14 @@ bool PopulateSampleFromPose(
         pose.vAngularVelocity.v[0],
         pose.vAngularVelocity.v[1],
         pose.vAngularVelocity.v[2]};
+    sample->world_from_driver_rotation_wxyz = {1.0, 0.0, 0.0, 0.0};
+    sample->driver_from_head_rotation_wxyz = {1.0, 0.0, 0.0, 0.0};
     sample->pose_valid = pose.bPoseIsValid;
     sample->device_connected = pose.bDeviceIsConnected;
     sample->tracking_result = static_cast<std::int32_t>(pose.eTrackingResult);
+    sample->will_drift_in_yaw = false;
+    sample->should_apply_head_model = false;
     return true;
 }
+
 }  // namespace steamvr_capture::capture

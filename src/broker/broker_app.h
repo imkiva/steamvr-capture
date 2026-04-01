@@ -40,6 +40,10 @@ private:
     void AdvancePlayback(std::chrono::steady_clock::time_point now);
     void ClearLivePoseSlots();
     void UpdateLivePoseSlots();
+    void PollRecordingState(std::chrono::steady_clock::time_point now);
+    bool BeginRecording(const std::filesystem::path& output_path, std::string* error);
+    void EndRecording(const std::string& status_text);
+    void CaptureRecordingSamples(std::chrono::steady_clock::time_point now);
     void RefreshVrServerTarget();
     void UpdateSharedState();
     bool EnsureInjected(std::string* error);
@@ -65,8 +69,21 @@ private:
     std::string session_path_;
     session::SessionData loaded_session_;
     std::vector<std::wstring> target_serials_;
+    std::vector<std::uint32_t> target_device_classes_;
+    std::vector<std::size_t> target_session_indices_;
     std::uint64_t playback_base_timestamp_ns_ = 0u;
     std::uint64_t playback_timestamp_ns_ = 0u;
     std::chrono::steady_clock::time_point playback_started_at_{};
+    bool recording_active_ = false;
+    float record_interval_ms_ = 10.0f;
+    std::filesystem::path recording_output_path_;
+    session::SessionWriter recording_writer_;
+    std::vector<session::TrackerDescriptor> recording_devices_;
+    std::vector<std::wstring> recording_serials_;
+    session::TrackingSpaceSnapshot recording_tracking_space_;
+    std::chrono::steady_clock::time_point recording_started_at_{};
+    std::chrono::steady_clock::time_point next_record_sample_at_{};
+    std::uint64_t recorded_sample_count_ = 0u;
+    std::string recording_status_text_ = "Recorder idle.";
 };
 }  // namespace steamvr_capture::broker

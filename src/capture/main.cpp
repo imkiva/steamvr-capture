@@ -311,7 +311,7 @@ bool PrettyPrintSessionFile(const std::filesystem::path& path, std::string* erro
     }
 
     std::cout << "Pretty print for " << path.string() << "\n";
-    std::cout << "Summary: trackers=" << session_data.trackers.size()
+    std::cout << "Summary: devices=" << session_data.trackers.size()
               << " duration_ns=" << session_data.duration_ns << "\n\n";
 
     std::string line;
@@ -342,6 +342,13 @@ bool PrettyPrintSessionFile(const std::filesystem::path& path, std::string* erro
             continue;
         }
 
+        if (kind == "DEVICES" && tokens.size() == 2)
+        {
+            std::cout << "Line " << line_number << " [DEVICE_COUNT] "
+                      << "count=" << tokens[1] << "\n";
+            continue;
+        }
+
         if (kind == "TRACKER" && tokens.size() == 6)
         {
             std::cout << "Line " << line_number << " [TRACKER] "
@@ -350,6 +357,28 @@ bool PrettyPrintSessionFile(const std::filesystem::path& path, std::string* erro
                       << " tracking_system=" << FormatField(tokens[3])
                       << " model_number=" << FormatField(tokens[4])
                       << " role=" << FormatField(tokens[5]) << "\n";
+            continue;
+        }
+
+        if (kind == "DEVICE" && tokens.size() == 9)
+        {
+            std::cout << "Line " << line_number << " [DEVICE] "
+                      << "index=" << tokens[1]
+                      << " class=" << tokens[2]
+                      << " serial=" << FormatField(tokens[3])
+                      << " tracking_system=" << FormatField(tokens[4])
+                      << " model_number=" << FormatField(tokens[5])
+                      << " manufacturer=" << FormatField(tokens[6])
+                      << " controller_type=" << FormatField(tokens[7])
+                      << " role=" << FormatField(tokens[8]) << "\n";
+            continue;
+        }
+
+        if (kind == "SPACE" && tokens.size() == 27)
+        {
+            std::cout << "Line " << line_number << " [SPACE] "
+                      << "has_raw_to_standing=" << (tokens[1] == "1" ? "true" : "false")
+                      << " has_seated_to_standing=" << (tokens[14] == "1" ? "true" : "false") << "\n";
             continue;
         }
 
@@ -406,6 +435,92 @@ bool PrettyPrintSessionFile(const std::filesystem::path& path, std::string* erro
             continue;
         }
 
+        if (kind == "POSE" && tokens.size() == 36)
+        {
+            std::uint64_t timestamp_ns = 0;
+            std::size_t tracker_index = 0;
+            double pose_time_offset_s = 0.0;
+            std::array<double, 3> position{};
+            std::array<double, 4> rotation{};
+            std::array<double, 3> linear_velocity{};
+            std::array<double, 3> angular_velocity{};
+            std::array<double, 4> world_from_driver_rotation{};
+            std::array<double, 3> world_from_driver_translation{};
+            std::array<double, 4> driver_from_head_rotation{};
+            std::array<double, 3> driver_from_head_translation{};
+            int pose_valid = 0;
+            int device_connected = 0;
+            int tracking_result = 0;
+            int will_drift_in_yaw = 0;
+            int should_apply_head_model = 0;
+
+            bool ok = ParseValue(tokens[1], &timestamp_ns) &&
+                ParseValue(tokens[2], &tracker_index) &&
+                ParseValue(tokens[3], &pose_time_offset_s);
+            for (int i = 0; ok && i < 3; ++i)
+            {
+                ok = ParseValue(tokens[4 + i], &position[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 4; ++i)
+            {
+                ok = ParseValue(tokens[7 + i], &rotation[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 3; ++i)
+            {
+                ok = ParseValue(tokens[11 + i], &linear_velocity[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 3; ++i)
+            {
+                ok = ParseValue(tokens[14 + i], &angular_velocity[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 4; ++i)
+            {
+                ok = ParseValue(tokens[17 + i], &world_from_driver_rotation[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 3; ++i)
+            {
+                ok = ParseValue(tokens[21 + i], &world_from_driver_translation[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 4; ++i)
+            {
+                ok = ParseValue(tokens[24 + i], &driver_from_head_rotation[static_cast<std::size_t>(i)]);
+            }
+            for (int i = 0; ok && i < 3; ++i)
+            {
+                ok = ParseValue(tokens[28 + i], &driver_from_head_translation[static_cast<std::size_t>(i)]);
+            }
+            ok = ok &&
+                ParseValue(tokens[31], &pose_valid) &&
+                ParseValue(tokens[32], &device_connected) &&
+                ParseValue(tokens[33], &tracking_result) &&
+                ParseValue(tokens[34], &will_drift_in_yaw) &&
+                ParseValue(tokens[35], &should_apply_head_model);
+
+            if (!ok)
+            {
+                std::cout << "Line " << line_number << " [POSE] parse_error raw=" << line << "\n";
+                continue;
+            }
+
+            std::cout << "Line " << line_number << " [POSE] "
+                      << "timestamp_ns=" << timestamp_ns
+                      << " device_index=" << tracker_index
+                      << " pose_time_offset_s=" << pose_time_offset_s
+                      << " position_m=" << FormatVec3(position)
+                      << " rotation_wxyz=" << FormatQuat(rotation)
+                      << " world_from_driver_rotation_wxyz=" << FormatQuat(world_from_driver_rotation)
+                      << " world_from_driver_translation_m=" << FormatVec3(world_from_driver_translation)
+                      << " driver_from_head_rotation_wxyz=" << FormatQuat(driver_from_head_rotation)
+                      << " driver_from_head_translation_m=" << FormatVec3(driver_from_head_translation)
+                      << " pose_valid=" << (pose_valid != 0 ? "true" : "false")
+                      << " device_connected=" << (device_connected != 0 ? "true" : "false")
+                      << " tracking_result=" << tracking_result
+                      << " will_drift_in_yaw=" << (will_drift_in_yaw != 0 ? "true" : "false")
+                      << " should_apply_head_model=" << (should_apply_head_model != 0 ? "true" : "false")
+                      << "\n";
+            continue;
+        }
+
         std::cout << "Line " << line_number << " [UNKNOWN] raw=" << line << "\n";
     }
 
@@ -444,12 +559,17 @@ bool PrettyPrintSessionFileCsv(
             "magic",
             "version",
             "tracker_count",
+            "device_count",
+            "device_class",
             "tracker_index",
             "serial",
             "tracking_system",
             "model_number",
+            "manufacturer_name",
+            "controller_type",
             "role",
             "timestamp_ns",
+            "pose_time_offset_s",
             "position_x_m",
             "position_y_m",
             "position_z_m",
@@ -463,9 +583,25 @@ bool PrettyPrintSessionFileCsv(
             "angular_velocity_x_rps",
             "angular_velocity_y_rps",
             "angular_velocity_z_rps",
+            "world_from_driver_rotation_w",
+            "world_from_driver_rotation_x",
+            "world_from_driver_rotation_y",
+            "world_from_driver_rotation_z",
+            "world_from_driver_translation_x_m",
+            "world_from_driver_translation_y_m",
+            "world_from_driver_translation_z_m",
+            "driver_from_head_rotation_w",
+            "driver_from_head_rotation_x",
+            "driver_from_head_rotation_y",
+            "driver_from_head_rotation_z",
+            "driver_from_head_translation_x_m",
+            "driver_from_head_translation_y_m",
+            "driver_from_head_translation_z_m",
             "pose_valid",
             "device_connected",
             "tracking_result",
+            "will_drift_in_yaw",
+            "should_apply_head_model",
             "raw_line",
         });
 
@@ -477,26 +613,44 @@ bool PrettyPrintSessionFileCsv(
         const std::vector<std::string> tokens = SplitTabsPreservingEmpty(line);
         if (tokens.empty())
         {
-            WriteCsvRow(output, {std::to_string(line_number), "EMPTY", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            WriteCsvRow(output, {std::to_string(line_number), "EMPTY", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
             continue;
         }
 
         const std::string& kind = tokens[0];
         if (kind == "SVRCAP" && tokens.size() == 2)
         {
-            WriteCsvRow(output, {std::to_string(line_number), "HEADER", tokens[0], tokens[1], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            WriteCsvRow(output, {std::to_string(line_number), "HEADER", tokens[0], tokens[1], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
             continue;
         }
 
         if (kind == "TRACKERS" && tokens.size() == 2)
         {
-            WriteCsvRow(output, {std::to_string(line_number), "TRACKER_COUNT", "", "", tokens[1], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            WriteCsvRow(output, {std::to_string(line_number), "TRACKER_COUNT", "", "", tokens[1], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            continue;
+        }
+
+        if (kind == "DEVICES" && tokens.size() == 2)
+        {
+            WriteCsvRow(output, {std::to_string(line_number), "DEVICE_COUNT", "", "", "", tokens[1], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
             continue;
         }
 
         if (kind == "TRACKER" && tokens.size() == 6)
         {
-            WriteCsvRow(output, {std::to_string(line_number), "TRACKER", "", "", "", tokens[1], tokens[2], tokens[3], tokens[4], tokens[5], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            WriteCsvRow(output, {std::to_string(line_number), "TRACKER", "", "", "", "", "", tokens[1], tokens[2], tokens[3], tokens[4], "", "", tokens[5], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            continue;
+        }
+
+        if (kind == "DEVICE" && tokens.size() == 9)
+        {
+            WriteCsvRow(output, {std::to_string(line_number), "DEVICE", "", "", "", "", tokens[2], tokens[1], tokens[3], tokens[4], tokens[5], tokens[6], tokens[7], tokens[8], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            continue;
+        }
+
+        if (kind == "SPACE" && tokens.size() == 27)
+        {
+            WriteCsvRow(output, {std::to_string(line_number), "SPACE", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", tokens[1], tokens[14], line});
             continue;
         }
 
@@ -510,7 +664,69 @@ bool PrettyPrintSessionFileCsv(
                     "",
                     "",
                     "",
+                    "",
+                    "",
                     tokens[2],
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    tokens[1],
+                    "",
+                    tokens[3],
+                    tokens[4],
+                    tokens[5],
+                    tokens[6],
+                    tokens[7],
+                    tokens[8],
+                    tokens[9],
+                    tokens[10],
+                    tokens[11],
+                    tokens[12],
+                    tokens[13],
+                    tokens[14],
+                    tokens[15],
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    tokens[16],
+                    tokens[17],
+                    tokens[18],
+                    "",
+                    "",
+                    line,
+                });
+            continue;
+        }
+
+        if (kind == "POSE" && tokens.size() == 36)
+        {
+            WriteCsvRow(
+                output,
+                {
+                    std::to_string(line_number),
+                    "POSE",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    tokens[2],
+                    "",
+                    "",
                     "",
                     "",
                     "",
@@ -532,12 +748,29 @@ bool PrettyPrintSessionFileCsv(
                     tokens[16],
                     tokens[17],
                     tokens[18],
+                    tokens[19],
+                    tokens[20],
+                    tokens[21],
+                    tokens[22],
+                    tokens[23],
+                    tokens[24],
+                    tokens[25],
+                    tokens[26],
+                    tokens[27],
+                    tokens[28],
+                    tokens[29],
+                    tokens[30],
+                    tokens[31],
+                    tokens[32],
+                    tokens[33],
+                    tokens[34],
+                    tokens[35],
                     line,
                 });
             continue;
         }
 
-        WriteCsvRow(output, {std::to_string(line_number), "UNKNOWN", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+        WriteCsvRow(output, {std::to_string(line_number), "UNKNOWN", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
     }
 
     if (!output.good())

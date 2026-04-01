@@ -13,7 +13,9 @@
   },
   "overlay_steamvr_capture": {
     "session_root": "",
-    "record_interval_ms": 10.0
+    "record_interval_ms": 10.0,
+    "record_state": "stopped",
+    "record_output_path": ""
   },
   "steamvr_capture_hotpatch": {
     "suppress_real_trackers": true,

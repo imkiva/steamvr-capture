@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 
+#include "capture/openvr_app_helpers.h"
 #include "openvr.h"
 #include "session/replay_settings.h"
 #include "session/session_format.h"
@@ -68,6 +69,12 @@ std::string ReadSettingsString(const char* section, const char* key)
     return error == vr::VRSettingsError_None ? std::string(buffer) : std::string();
 }
 
+void WriteSettingsString(const char* section, const char* key, const std::string& value)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->SetString(section, key, value.c_str(), &error);
+}
+
 bool ReadSettingsBool(const char* section, const char* key, const bool fallback)
 {
     vr::EVRSettingsError error = vr::VRSettingsError_None;
@@ -90,6 +97,11 @@ std::string NormalizePlaybackState(const std::string& playback_state)
     }
 
     return "stopped";
+}
+
+std::string NormalizeRecordState(const std::string& record_state)
+{
+    return record_state == "recording" ? "recording" : "stopped";
 }
 
 hotpatch::LiveMode ParseLiveModeSetting(const std::string& live_mode, const bool suppress_real_trackers)
@@ -199,6 +211,7 @@ bool BrokerApp::Init(std::string* error)
         shared_state_->hook_state = static_cast<std::uint32_t>(hotpatch::HookState::BrokerReady);
         CopyWideText(shared_state_->hotpatch_dll_path, hotpatch_dll_path_.wstring());
         CopyWideText(shared_state_->broker_status_text, L"Broker initialized.");
+        CopyWideText(shared_state_->recording_status_text, L"Recorder idle.");
     }
 
     return true;
@@ -232,9 +245,12 @@ int BrokerApp::Run(const bool once)
         else
         {
             PollReplayState();
+            PollRecordingState(now);
             AdvancePlayback(now);
+            CaptureRecordingSamples(now);
             UpdateSharedState();
-            const bool should_inject = playback_active_ && live_mode_ != hotpatch::LiveMode::Passthrough;
+            const bool should_inject =
+                recording_active_ || (playback_active_ && live_mode_ != hotpatch::LiveMode::Passthrough);
             if (should_inject)
             {
                 std::string inject_error;
@@ -257,7 +273,7 @@ int BrokerApp::Run(const bool once)
         if (!once)
         {
             const auto sleep_interval =
-                (playback_active_ && live_mode_ == hotpatch::LiveMode::Replace)
+                (recording_active_ || (playback_active_ && live_mode_ == hotpatch::LiveMode::Replace))
                 ? std::chrono::milliseconds(8)
                 : std::chrono::milliseconds(250);
             std::this_thread::sleep_for(sleep_interval);
@@ -279,6 +295,7 @@ int BrokerApp::PrintStatus()
     std::printf("target_pid=%u\n", shared_state_->target_pid);
     std::printf("injected_pid=%u\n", shared_state_->injected_pid);
     std::printf("playback_active=%u\n", shared_state_->playback_active);
+    std::printf("recording_active=%u\n", shared_state_->recording_active);
     std::printf("suppress_real_trackers=%u\n", shared_state_->suppress_real_trackers);
     std::printf("mode=%u\n", shared_state_->live_mode);
     std::printf("hook_state=%u\n", static_cast<unsigned>(hook_state));
@@ -286,10 +303,14 @@ int BrokerApp::PrintStatus()
     std::printf("pose_updates_seen=%u\n", shared_state_->pose_updates_seen);
     std::printf("pose_updates_suppressed=%u\n", shared_state_->pose_updates_suppressed);
     std::printf("pose_updates_replaced=%u\n", shared_state_->pose_updates_replaced);
+    std::printf("recording_devices=%u\n", shared_state_->recording_device_count);
+    std::printf("recorded_sample_count=%llu\n", static_cast<unsigned long long>(shared_state_->recorded_sample_count));
     std::printf("playback_timestamp_ns=%llu\n", static_cast<unsigned long long>(shared_state_->playback_timestamp_ns));
     std::printf("session=%s\n", WideToUtf8(shared_state_->session_path).c_str());
+    std::printf("recording_output=%s\n", WideToUtf8(shared_state_->recording_output_path).c_str());
     std::printf("broker_status=%s\n", WideToUtf8(shared_state_->broker_status_text).c_str());
     std::printf("dll_status=%s\n", WideToUtf8(shared_state_->dll_status_text).c_str());
+    std::printf("recording_status=%s\n", WideToUtf8(shared_state_->recording_status_text).c_str());
     std::printf("serial_count=%u\n", shared_state_->serial_count);
     for (std::uint32_t index = 0; index < shared_state_->serial_count && index < hotpatch::kMaxTrackedSerials; ++index)
     {
@@ -521,9 +542,253 @@ void BrokerApp::PollReplayState()
     }
 }
 
+void BrokerApp::PollRecordingState(const std::chrono::steady_clock::time_point now)
+{
+    if (vr::VRSettings() == nullptr)
+    {
+        return;
+    }
+
+    record_interval_ms_ = static_cast<float>(ReadSettingsFloat(
+        replay_settings::kOverlaySection,
+        replay_settings::kRecordIntervalMsKey,
+        replay_settings::kDefaultRecordIntervalMs));
+    if (record_interval_ms_ <= 0.0f)
+    {
+        record_interval_ms_ = replay_settings::kDefaultRecordIntervalMs;
+    }
+
+    const std::string record_state = NormalizeRecordState(ReadSettingsString(
+        replay_settings::kOverlaySection,
+        replay_settings::kRecordStateKey));
+    const std::filesystem::path output_path = std::filesystem::path(Utf8ToWide(ReadSettingsString(
+        replay_settings::kOverlaySection,
+        replay_settings::kRecordOutputPathKey)));
+
+    if (record_state == "recording")
+    {
+        if (!recording_active_)
+        {
+            std::string error;
+            if (!BeginRecording(output_path, &error))
+            {
+                recording_status_text_ = error;
+                if (shared_state_ != nullptr)
+                {
+                    CopyWideText(shared_state_->recording_status_text, Utf8ToWide(error));
+                }
+                WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "stopped");
+            }
+        }
+        else
+        {
+            next_record_sample_at_ = std::min(next_record_sample_at_, now);
+        }
+        return;
+    }
+
+    if (recording_active_)
+    {
+        EndRecording("Saved recording to " + recording_output_path_.string());
+    }
+}
+
+bool BrokerApp::BeginRecording(const std::filesystem::path& output_path, std::string* error)
+{
+    if (!openvr_initialized_ || vr::VRSystem() == nullptr || vr::VRSettings() == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "SteamVR is not ready for driver-pose recording.";
+        }
+        return false;
+    }
+
+    if (output_path.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "Recording output path was empty.";
+        }
+        return false;
+    }
+
+    const auto devices = capture::EnumerateRecordableDevices(*vr::VRSystem(), *vr::VRSettings());
+    if (devices.empty())
+    {
+        if (error != nullptr)
+        {
+            *error = "No recordable HMD/controller/tracker devices were found.";
+        }
+        return false;
+    }
+
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(output_path.parent_path(), filesystem_error);
+    if (filesystem_error)
+    {
+        if (error != nullptr)
+        {
+            *error = "Failed to create recording directory: " + output_path.parent_path().string();
+        }
+        return false;
+    }
+
+    recording_devices_.clear();
+    recording_serials_.clear();
+    recording_devices_.reserve(devices.size());
+    recording_serials_.reserve(devices.size());
+    for (const auto& device : devices)
+    {
+        recording_devices_.push_back(device.descriptor);
+        recording_serials_.push_back(Utf8ToWide(device.descriptor.serial));
+    }
+
+    recording_tracking_space_ = capture::CaptureTrackingSpaceSnapshot(*vr::VRSystem());
+    if (!recording_writer_.Open(output_path, session::SessionFileVersion::DriverPoseV2, error) ||
+        !recording_writer_.WriteHeader(recording_devices_, recording_tracking_space_, error))
+    {
+        recording_writer_.Close();
+        recording_devices_.clear();
+        recording_serials_.clear();
+        return false;
+    }
+
+    recording_active_ = true;
+    recording_output_path_ = output_path;
+    recording_started_at_ = std::chrono::steady_clock::now();
+    next_record_sample_at_ = recording_started_at_;
+    recorded_sample_count_ = 0u;
+    recording_status_text_ = "Recording driver poses.";
+    if (shared_state_ != nullptr)
+    {
+        CopyWideText(shared_state_->recording_status_text, Utf8ToWide(recording_status_text_));
+    }
+    return true;
+}
+
+void BrokerApp::EndRecording(const std::string& status_text)
+{
+    recording_writer_.Close();
+    recording_active_ = false;
+    recording_devices_.clear();
+    recording_serials_.clear();
+    recording_tracking_space_ = {};
+    recorded_sample_count_ = 0u;
+    recording_status_text_ = status_text.empty() ? "Recorder idle." : status_text;
+    if (shared_state_ != nullptr)
+    {
+        CopyWideText(shared_state_->recording_status_text, Utf8ToWide(recording_status_text_));
+    }
+    WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "stopped");
+}
+
+void BrokerApp::CaptureRecordingSamples(const std::chrono::steady_clock::time_point now)
+{
+    if (!recording_active_ || shared_state_ == nullptr || recording_devices_.empty())
+    {
+        return;
+    }
+
+    const auto interval = std::chrono::duration<double, std::milli>(record_interval_ms_);
+    while (now >= next_record_sample_at_)
+    {
+        const std::uint64_t timestamp_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(next_record_sample_at_ - recording_started_at_).count());
+
+        for (std::size_t device_index = 0; device_index < recording_devices_.size(); ++device_index)
+        {
+            session::PoseSample sample;
+            sample.timestamp_ns = timestamp_ns;
+            sample.world_from_driver_rotation_wxyz = {1.0, 0.0, 0.0, 0.0};
+            sample.driver_from_head_rotation_wxyz = {1.0, 0.0, 0.0, 0.0};
+
+            const std::wstring& serial = recording_serials_[device_index];
+            bool observed = false;
+            const std::uint32_t observed_count = std::min<std::uint32_t>(
+                shared_state_->observed_device_count,
+                hotpatch::kMaxObservedDevices);
+            for (std::uint32_t observed_index = 0; observed_index < observed_count; ++observed_index)
+            {
+                const hotpatch::ObservedDeviceSlot& observed_device = shared_state_->observed_devices[observed_index];
+                if (observed_device.present == 0u ||
+                    observed_device.device_class != static_cast<std::uint32_t>(recording_devices_[device_index].device_class) ||
+                    _wcsicmp(observed_device.serial, serial.c_str()) != 0)
+                {
+                    continue;
+                }
+
+                const hotpatch::LivePoseSlot& live_pose = observed_device.pose;
+                sample.pose_time_offset_s = live_pose.pose_time_offset_s;
+                sample.position_m = {
+                    live_pose.position_m[0],
+                    live_pose.position_m[1],
+                    live_pose.position_m[2]};
+                sample.rotation_wxyz = {
+                    live_pose.rotation_wxyz[0],
+                    live_pose.rotation_wxyz[1],
+                    live_pose.rotation_wxyz[2],
+                    live_pose.rotation_wxyz[3]};
+                sample.linear_velocity_mps = {
+                    live_pose.linear_velocity_mps[0],
+                    live_pose.linear_velocity_mps[1],
+                    live_pose.linear_velocity_mps[2]};
+                sample.angular_velocity_rps = {
+                    live_pose.angular_velocity_rps[0],
+                    live_pose.angular_velocity_rps[1],
+                    live_pose.angular_velocity_rps[2]};
+                sample.world_from_driver_rotation_wxyz = {
+                    live_pose.world_from_driver_rotation_wxyz[0],
+                    live_pose.world_from_driver_rotation_wxyz[1],
+                    live_pose.world_from_driver_rotation_wxyz[2],
+                    live_pose.world_from_driver_rotation_wxyz[3]};
+                sample.world_from_driver_translation_m = {
+                    live_pose.world_from_driver_translation_m[0],
+                    live_pose.world_from_driver_translation_m[1],
+                    live_pose.world_from_driver_translation_m[2]};
+                sample.driver_from_head_rotation_wxyz = {
+                    live_pose.driver_from_head_rotation_wxyz[0],
+                    live_pose.driver_from_head_rotation_wxyz[1],
+                    live_pose.driver_from_head_rotation_wxyz[2],
+                    live_pose.driver_from_head_rotation_wxyz[3]};
+                sample.driver_from_head_translation_m = {
+                    live_pose.driver_from_head_translation_m[0],
+                    live_pose.driver_from_head_translation_m[1],
+                    live_pose.driver_from_head_translation_m[2]};
+                sample.pose_valid = live_pose.pose_valid != 0u;
+                sample.device_connected = live_pose.device_connected != 0u;
+                sample.tracking_result = live_pose.tracking_result;
+                sample.will_drift_in_yaw = live_pose.will_drift_in_yaw != 0u;
+                sample.should_apply_head_model = live_pose.should_apply_head_model != 0u;
+                observed = true;
+                break;
+            }
+
+            if (!observed)
+            {
+                sample.pose_valid = false;
+                sample.device_connected = false;
+                sample.tracking_result = static_cast<std::int32_t>(vr::TrackingResult_Uninitialized);
+            }
+
+            std::string write_error;
+            if (!recording_writer_.WriteSample(device_index, sample, &write_error))
+            {
+                EndRecording("Recording failed: " + write_error);
+                return;
+            }
+        }
+
+        ++recorded_sample_count_;
+        next_record_sample_at_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
+    }
+}
+
 void BrokerApp::LoadSessionTargets()
 {
     target_serials_.clear();
+    target_device_classes_.clear();
+    target_session_indices_.clear();
     loaded_session_ = {};
     playback_base_timestamp_ns_ = 0u;
     playback_timestamp_ns_ = 0u;
@@ -547,8 +812,9 @@ void BrokerApp::LoadSessionTargets()
 
     loaded_session_ = std::move(session_data);
 
-    for (const session::TrackerDescriptor& tracker : loaded_session_.trackers)
+    for (std::size_t session_index = 0; session_index < loaded_session_.trackers.size(); ++session_index)
     {
+        const session::TrackerDescriptor& tracker = loaded_session_.trackers[session_index];
         if (tracker.serial.empty())
         {
             continue;
@@ -560,6 +826,8 @@ void BrokerApp::LoadSessionTargets()
         }
 
         target_serials_.push_back(Utf8ToWide(tracker.serial));
+        target_device_classes_.push_back(static_cast<std::uint32_t>(tracker.device_class));
+        target_session_indices_.push_back(session_index);
     }
 }
 
@@ -664,10 +932,11 @@ void BrokerApp::UpdateLivePoseSlots()
         return;
     }
 
-    const std::size_t tracker_count = std::min<std::size_t>(loaded_session_.trackers.size(), hotpatch::kMaxTrackedSerials);
+    const std::size_t tracker_count = std::min<std::size_t>(target_session_indices_.size(), hotpatch::kMaxTrackedSerials);
     for (std::size_t tracker_index = 0; tracker_index < tracker_count; ++tracker_index)
     {
-        const auto sample = session::SampleAtOrBefore(loaded_session_, tracker_index, playback_timestamp_ns_);
+        const std::size_t session_index = target_session_indices_[tracker_index];
+        const auto sample = session::SampleAtOrBefore(loaded_session_, session_index, playback_timestamp_ns_);
         if (!sample.has_value())
         {
             continue;
@@ -678,19 +947,28 @@ void BrokerApp::UpdateLivePoseSlots()
         live_pose.sample_present = 1u;
         live_pose.device_connected = sample->device_connected ? 1u : 0u;
         live_pose.pose_valid = sample->pose_valid ? 1u : 0u;
+        live_pose.will_drift_in_yaw = sample->will_drift_in_yaw ? 1u : 0u;
+        live_pose.should_apply_head_model = sample->should_apply_head_model ? 1u : 0u;
         live_pose.tracking_result = sample->tracking_result;
         live_pose.sample_timestamp_ns = sample->timestamp_ns;
+        live_pose.pose_time_offset_s = sample->pose_time_offset_s;
 
         for (std::size_t axis = 0; axis < 3u; ++axis)
         {
             live_pose.position_m[axis] = sample->position_m[axis];
             live_pose.linear_velocity_mps[axis] = sample->linear_velocity_mps[axis];
             live_pose.angular_velocity_rps[axis] = sample->angular_velocity_rps[axis];
+            live_pose.world_from_driver_translation_m[axis] = sample->world_from_driver_translation_m[axis];
+            live_pose.driver_from_head_translation_m[axis] = sample->driver_from_head_translation_m[axis];
         }
 
         for (std::size_t component = 0; component < 4u; ++component)
         {
             live_pose.rotation_wxyz[component] = sample->rotation_wxyz[component];
+            live_pose.world_from_driver_rotation_wxyz[component] =
+                sample->world_from_driver_rotation_wxyz[component];
+            live_pose.driver_from_head_rotation_wxyz[component] =
+                sample->driver_from_head_rotation_wxyz[component];
         }
     }
 }
@@ -715,18 +993,39 @@ void BrokerApp::UpdateSharedState()
     shared_state_->live_mode = static_cast<std::uint32_t>(live_mode_);
     shared_state_->serial_count = static_cast<std::uint32_t>(target_serials_.size());
     shared_state_->playback_timestamp_ns = playback_timestamp_ns_;
+    shared_state_->recording_active = recording_active_ ? 1u : 0u;
+    shared_state_->recording_device_count = static_cast<std::uint32_t>(recording_devices_.size());
+    shared_state_->recorded_sample_count = recorded_sample_count_;
     CopyWideText(shared_state_->session_path, Utf8ToWide(session_path_));
+    CopyWideText(shared_state_->recording_output_path, recording_output_path_.wstring());
 
     for (std::size_t index = 0; index < hotpatch::kMaxTrackedSerials; ++index)
     {
         if (index < target_serials_.size())
         {
+            shared_state_->serials[index].device_class =
+                index < target_device_classes_.size() ? target_device_classes_[index] : 0u;
             CopyWideText(shared_state_->serials[index].serial, target_serials_[index]);
         }
         else
         {
+            shared_state_->serials[index].device_class = 0u;
             shared_state_->serials[index].serial[0] = L'\0';
         }
+    }
+
+    if (recording_active_)
+    {
+        recording_status_text_ =
+            "Recording " + std::to_string(recording_devices_.size()) + " device(s), samples=" +
+            std::to_string(recorded_sample_count_);
+        CopyWideText(
+            shared_state_->recording_status_text,
+            Utf8ToWide(recording_status_text_));
+    }
+    else
+    {
+        CopyWideText(shared_state_->recording_status_text, Utf8ToWide(recording_status_text_));
     }
 
     if (target_pid_ == 0u)

@@ -144,6 +144,7 @@ endif ()
 add_executable(steamvr_capture_broker
     src/broker/main.cpp
     src/broker/broker_app.cpp
+    src/capture/openvr_app_helpers.cpp
 )
 
 target_include_directories(steamvr_capture_broker
