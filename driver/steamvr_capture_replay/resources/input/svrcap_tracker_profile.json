@@ -1,0 +1,13 @@
+{
+  "jsonid": "input_profile",
+  "controller_type": "svrcap_replay_tracker",
+  "device_class": "TrackedDeviceClass_GenericTracker",
+  "driver_name": "steamvr_capture_replay",
+  "input_bindingui_mode": "single_device",
+  "input_source": {
+    "/pose/raw": {
+      "type": "pose"
+    }
+  },
+  "default_bindings": []
+}

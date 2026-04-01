@@ -1,0 +1,8 @@
+{
+  "driver_steamvr_capture_replay": {
+    "enable": true,
+    "session_path": "",
+    "loop": true,
+    "playback_speed": 1.0
+  }
+}
