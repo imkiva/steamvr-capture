@@ -3,6 +3,7 @@
 namespace steamvr_capture::replay_settings
 {
 constexpr char kDriverSection[] = "driver_steamvr_capture_replay";
+constexpr char kLighthouseProxySection[] = "driver_steamvr_capture_lighthouse_proxy";
 constexpr char kOverlaySection[] = "overlay_steamvr_capture";
 
 constexpr char kEnableKey[] = "enable";
@@ -15,6 +16,8 @@ constexpr char kLoadedSessionPathKey[] = "loaded_session_path";
 constexpr char kLoadedTrackerCountKey[] = "loaded_tracker_count";
 constexpr char kStatusTextKey[] = "status_text";
 constexpr char kLastErrorKey[] = "last_error";
+constexpr char kTargetDriverPathKey[] = "target_driver_path";
+constexpr char kSuppressReplayTrackersKey[] = "suppress_replay_trackers";
 
 constexpr char kSessionRootKey[] = "session_root";
 

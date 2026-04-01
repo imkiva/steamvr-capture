@@ -37,6 +37,12 @@ The project is intentionally split into two OpenVR layers:
    - Browses `.svrcap` session files and accepts direct path entry through the SteamVR keyboard.
    - Writes replay control state into `vrsettings` so the replay driver can hot-reload the selected session without hard-coded config edits.
 
+5. `hotpatch-broker` and `steamvr hotpatch dll`
+   - Experimental no-restart path for live interception inside `vrserver.exe`.
+   - `hotpatch-broker` runs as a user-space helper process, watches replay settings, parses the selected session, and injects the hotpatch DLL into `vrserver.exe`.
+   - `steamvr hotpatch dll` runs inside `vrserver.exe`, reads a shared-memory control block, detects when `driver_lighthouse.dll` is loaded, and is the eventual hook point for `passthrough / suppress / replace`.
+   - This path is intentionally separate from the replay driver because it is a runtime hook architecture, not a normal OpenVR driver lifecycle.
+
 ## Constraints
 
 - Do not mix `openvr.h` and `openvr_driver.h` inside the same binary.
@@ -46,6 +52,11 @@ The project is intentionally split into two OpenVR layers:
 - Session files must include serial number, tracking system name, model number, and tracker role metadata.
 - Replay driver must expose unique virtual serial numbers and must not impersonate real HTC tracker serial numbers.
 - MVP assumes real trackers are disconnected or powered off during replay to avoid role conflicts.
+- The no-restart hotpatch path is experimental and unsupported by Valve. Keep heavy logic out of the injected DLL; session parsing and transport control belong in the broker.
+
+## Shell Execution
+
+- When running PowerShell commands for this repo, always start PowerShell in `-NoProfile -NonInteractive` mode to avoid profile side effects and PSReadLine noise.
 
 ## Current MVP Scope
 

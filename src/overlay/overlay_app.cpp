@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <tlhelp32.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -53,6 +54,7 @@ enum class ButtonAction
     Pause,
     Stop,
     ToggleLoop,
+    ToggleRealTrackerSuppress,
     EditRoot,
     EditPath,
     PasteClipboard,
@@ -127,6 +129,85 @@ std::filesystem::path GetExecutablePath()
     const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
     buffer.resize(length);
     return std::filesystem::path(buffer);
+}
+
+bool IsProcessRunning(const wchar_t* process_name)
+{
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+    {
+        return false;
+    }
+
+    PROCESSENTRY32W process_entry{};
+    process_entry.dwSize = sizeof(process_entry);
+    if (!Process32FirstW(snapshot, &process_entry))
+    {
+        CloseHandle(snapshot);
+        return false;
+    }
+
+    bool found = false;
+    do
+    {
+        if (_wcsicmp(process_entry.szExeFile, process_name) == 0)
+        {
+            found = true;
+            break;
+        }
+    } while (Process32NextW(snapshot, &process_entry));
+
+    CloseHandle(snapshot);
+    return found;
+}
+
+bool EnsureBrokerRunning(const std::filesystem::path& exe_directory, std::string* error)
+{
+    constexpr wchar_t kBrokerProcessName[] = L"steamvr_capture_broker.exe";
+    if (IsProcessRunning(kBrokerProcessName))
+    {
+        return true;
+    }
+
+    const std::filesystem::path broker_path = exe_directory / kBrokerProcessName;
+    std::error_code filesystem_error;
+    if (!std::filesystem::exists(broker_path, filesystem_error))
+    {
+        if (error != nullptr)
+        {
+            *error = "Hotpatch broker executable was not found: " + broker_path.string();
+        }
+        return false;
+    }
+
+    std::wstring command_line = L"\"" + broker_path.wstring() + L"\"";
+    STARTUPINFOW startup_info{};
+    startup_info.cb = sizeof(startup_info);
+    PROCESS_INFORMATION process_info{};
+
+    const BOOL started = CreateProcessW(
+        broker_path.c_str(),
+        command_line.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        exe_directory.wstring().c_str(),
+        &startup_info,
+        &process_info);
+    if (!started)
+    {
+        if (error != nullptr)
+        {
+            *error = "Failed to start hotpatch broker process.";
+        }
+        return false;
+    }
+
+    CloseHandle(process_info.hThread);
+    CloseHandle(process_info.hProcess);
+    return true;
 }
 
 std::string ReadSettingsString(const char* section, const char* key)
@@ -498,6 +579,7 @@ struct OverlayState
     std::string last_error;
     std::int32_t loaded_tracker_count = 0;
     bool loop_enabled = true;
+    bool suppress_real_trackers = true;
     std::chrono::steady_clock::time_point last_settings_refresh{};
     KeyboardMode keyboard_mode = KeyboardMode::None;
     std::vector<Button> buttons;
@@ -760,6 +842,12 @@ bool OverlayApp::Impl::Init(std::string* error)
         return false;
     }
 
+    std::string broker_error;
+    if (!EnsureBrokerRunning(state.exe_path.parent_path(), &broker_error))
+    {
+        state.last_error = broker_error;
+    }
+
     RefreshSettings(true);
     Render();
     return true;
@@ -890,6 +978,16 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
     if (loop_enabled != state.loop_enabled)
     {
         state.loop_enabled = loop_enabled;
+        dirty = true;
+    }
+
+    const bool suppress_real_trackers = ReadSettingsBool(
+        replay_settings::kLighthouseProxySection,
+        replay_settings::kSuppressReplayTrackersKey,
+        true);
+    if (suppress_real_trackers != state.suppress_real_trackers)
+    {
+        state.suppress_real_trackers = suppress_real_trackers;
         dirty = true;
     }
 
@@ -1105,6 +1203,20 @@ void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_
     case ButtonAction::ToggleLoop:
         state.loop_enabled = !state.loop_enabled;
         WriteSettingsBool(replay_settings::kDriverSection, replay_settings::kLoopKey, state.loop_enabled);
+        state.dirty = true;
+        return;
+
+    case ButtonAction::ToggleRealTrackerSuppress:
+        state.suppress_real_trackers = !state.suppress_real_trackers;
+        WriteSettingsBool(replay_settings::kLighthouseProxySection, replay_settings::kEnableKey, true);
+        WriteSettingsBool(
+            replay_settings::kLighthouseProxySection,
+            replay_settings::kSuppressReplayTrackersKey,
+            state.suppress_real_trackers);
+        state.status_text = state.suppress_real_trackers
+            ? "Requested real tracker suppression"
+            : "Requested passthrough for real trackers";
+        state.last_error.clear();
         state.dirty = true;
         return;
 
@@ -1465,6 +1577,11 @@ void OverlayApp::Impl::RenderMainOverlay()
         ButtonAction::ToggleLoop,
         0,
         state.loop_enabled ? L"Loop: On" : L"Loop: Off");
+    AddButton(
+        RECT{920, 192, 1280, 244},
+        ButtonAction::ToggleRealTrackerSuppress,
+        0,
+        state.suppress_real_trackers ? L"Suppress Real: On" : L"Suppress Real: Off");
 
     const RECT left_panel{40, 276, 1010, 466};
     const RECT right_panel{1040, 276, 1560, 466};
@@ -1593,7 +1710,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Use Play to start. Suppress Real only takes effect when the experimental lighthouse proxy driver is registered and SteamVR has been restarted with it enabled. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -1679,6 +1796,7 @@ void OverlayApp::Impl::AddButton(
         break;
 
     case ButtonAction::ToggleLoop:
+    case ButtonAction::ToggleRealTrackerSuppress:
         fill = RGB(48, 68, 97);
         frame = RGB(133, 187, 237);
         break;

@@ -17,6 +17,8 @@ endif ()
 set(PROJECT_RUNTIME_DIR "${CMAKE_BINARY_DIR}/runtime")
 set(DRIVER_PACKAGE_NAME "steamvr_capture_replay")
 set(DRIVER_PACKAGE_DIR "${PROJECT_RUNTIME_DIR}/${DRIVER_PACKAGE_NAME}")
+set(PROXY_DRIVER_PACKAGE_NAME "steamvr_capture_lighthouse_proxy")
+set(PROXY_DRIVER_PACKAGE_DIR "${PROJECT_RUNTIME_DIR}/${PROXY_DRIVER_PACKAGE_NAME}")
 set(OPENVR_ROOT "${CMAKE_SOURCE_DIR}/third_party/openvr")
 set(OPENVR_INCLUDE_DIR "${OPENVR_ROOT}/headers")
 set(OPENVR_LIBRARY "${OPENVR_ROOT}/lib/win64/openvr_api.lib")
@@ -97,6 +99,153 @@ if (MINGW)
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "${runtime_dll}"
                     "$<TARGET_FILE_DIR:steamvr_capture_recorder>"
+            )
+        endif ()
+    endforeach ()
+endif ()
+
+add_library(steamvr_capture_hotpatch SHARED
+    src/hotpatch/dllmain.cpp
+    src/hotpatch/hotpatch_runtime.cpp
+)
+
+target_include_directories(steamvr_capture_hotpatch
+    PRIVATE
+        "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_compile_definitions(steamvr_capture_hotpatch
+    PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+)
+
+set_target_properties(steamvr_capture_hotpatch PROPERTIES
+    OUTPUT_NAME "steamvr_capture_hotpatch"
+    PREFIX ""
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_RUNTIME_DIR}/tools"
+)
+
+if (MINGW)
+    foreach (runtime_dll IN LISTS MINGW_RUNTIME_DLLS)
+        if (EXISTS "${runtime_dll}")
+            add_custom_command(
+                TARGET steamvr_capture_hotpatch
+                POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${runtime_dll}"
+                    "$<TARGET_FILE_DIR:steamvr_capture_hotpatch>"
+            )
+        endif ()
+    endforeach ()
+endif ()
+
+add_executable(steamvr_capture_broker
+    src/broker/main.cpp
+    src/broker/broker_app.cpp
+)
+
+target_include_directories(steamvr_capture_broker
+    PRIVATE
+        "${OPENVR_INCLUDE_DIR}"
+        "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_link_libraries(steamvr_capture_broker
+    PRIVATE
+        steamvr_capture_session
+        "${OPENVR_LIBRARY}"
+)
+
+target_compile_definitions(steamvr_capture_broker
+    PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+)
+
+set_target_properties(steamvr_capture_broker PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_RUNTIME_DIR}/tools"
+)
+
+add_dependencies(steamvr_capture_broker steamvr_capture_hotpatch)
+
+add_custom_command(
+    TARGET steamvr_capture_broker
+    POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${OPENVR_DLL}"
+        "$<TARGET_FILE_DIR:steamvr_capture_broker>/openvr_api.dll"
+)
+
+if (MINGW)
+    foreach (runtime_dll IN LISTS MINGW_RUNTIME_DLLS)
+        if (EXISTS "${runtime_dll}")
+            add_custom_command(
+                TARGET steamvr_capture_broker
+                POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${runtime_dll}"
+                    "$<TARGET_FILE_DIR:steamvr_capture_broker>"
+            )
+        endif ()
+    endforeach ()
+endif ()
+
+add_library(driver_steamvr_capture_lighthouse_proxy SHARED
+    src/proxy_driver/hmd_driver_factory.cpp
+    src/proxy_driver/lighthouse_proxy_provider.cpp
+    src/replay_driver/driver_log.cpp
+)
+
+target_include_directories(driver_steamvr_capture_lighthouse_proxy
+    PRIVATE
+        "${OPENVR_INCLUDE_DIR}"
+        "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_link_libraries(driver_steamvr_capture_lighthouse_proxy
+    PRIVATE
+        steamvr_capture_session
+        "${OPENVR_LIBRARY}"
+)
+
+target_compile_definitions(driver_steamvr_capture_lighthouse_proxy
+    PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+)
+
+set_target_properties(driver_steamvr_capture_lighthouse_proxy PROPERTIES
+    OUTPUT_NAME "driver_steamvr_capture_lighthouse_proxy"
+    PREFIX ""
+    RUNTIME_OUTPUT_DIRECTORY "${PROXY_DRIVER_PACKAGE_DIR}/bin/win64"
+)
+
+add_custom_command(
+    TARGET driver_steamvr_capture_lighthouse_proxy
+    PRE_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+        "${CMAKE_SOURCE_DIR}/driver/${PROXY_DRIVER_PACKAGE_NAME}"
+        "${PROXY_DRIVER_PACKAGE_DIR}"
+)
+
+add_custom_command(
+    TARGET driver_steamvr_capture_lighthouse_proxy
+    POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${OPENVR_DLL}"
+        "$<TARGET_FILE_DIR:driver_steamvr_capture_lighthouse_proxy>/openvr_api.dll"
+)
+
+if (MINGW)
+    foreach (runtime_dll IN LISTS MINGW_RUNTIME_DLLS)
+        if (EXISTS "${runtime_dll}")
+            add_custom_command(
+                TARGET driver_steamvr_capture_lighthouse_proxy
+                POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${runtime_dll}"
+                    "$<TARGET_FILE_DIR:driver_steamvr_capture_lighthouse_proxy>"
             )
         endif ()
     endforeach ()
