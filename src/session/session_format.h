@@ -14,6 +14,7 @@ enum class SessionFileVersion : std::uint32_t
 {
     LegacyV1 = 1u,
     DriverPoseV2 = 2u,
+    CalibratedStandingPoseV3 = 3u,
 };
 
 struct TrackerDescriptor

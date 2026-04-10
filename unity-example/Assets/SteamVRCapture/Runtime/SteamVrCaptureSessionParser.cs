@@ -139,6 +139,11 @@ namespace SteamVRCapture.UnityExample
                 List<string> tokens = SplitTabs(line);
                 if (tokens.Count != 19 || tokens[0] != "SAMPLE")
                 {
+                    if (lineIndex == lines.Count - 1 && tokens.Count > 0 && tokens[0] == "SAMPLE" && tokens.Count < 19)
+                    {
+                        break;
+                    }
+
                     throw new InvalidDataException("Sample line is invalid.");
                 }
 
@@ -267,6 +272,11 @@ namespace SteamVRCapture.UnityExample
                 List<string> tokens = SplitTabs(line);
                 if (tokens.Count != 36 || tokens[0] != "POSE")
                 {
+                    if (lineIndex == lines.Count - 1 && tokens.Count > 0 && tokens[0] == "POSE" && tokens.Count < 36)
+                    {
+                        break;
+                    }
+
                     throw new InvalidDataException("Pose line is invalid.");
                 }
 

@@ -8,6 +8,9 @@ namespace steamvr_capture::session
 namespace
 {
 constexpr char kTab = '\t';
+constexpr const char* kPoseSpaceKey = "POSE_SPACE";
+constexpr const char* kDriverPoseSpaceValue = "driver";
+constexpr const char* kAppStandingPoseSpaceValue = "app_standing_calibrated";
 
 std::string EscapeField(const std::string& value)
 {
@@ -272,9 +275,37 @@ bool ParseLegacyV1(std::ifstream& stream, SessionData* session, std::string* err
     return true;
 }
 
-bool ParseDriverPoseV2(std::ifstream& stream, SessionData* session, std::string* error)
+bool ParsePoseChannelSession(
+    std::ifstream& stream,
+    SessionData* session,
+    std::string* error,
+    const SessionFileVersion format_version,
+    const bool poses_are_driver_space)
 {
     std::string line;
+    if (format_version == SessionFileVersion::CalibratedStandingPoseV3)
+    {
+        if (!std::getline(stream, line))
+        {
+            if (error != nullptr)
+            {
+                *error = "Session file is missing pose-space metadata.";
+            }
+            return false;
+        }
+
+        const std::vector<std::string> pose_space_tokens = SplitTabs(line);
+        if (pose_space_tokens.size() != 2 || pose_space_tokens[0] != kPoseSpaceKey ||
+            pose_space_tokens[1] != kAppStandingPoseSpaceValue)
+        {
+            if (error != nullptr)
+            {
+                *error = "Session file pose-space line is invalid.";
+            }
+            return false;
+        }
+    }
+
     if (!std::getline(stream, line))
     {
         if (error != nullptr)
@@ -297,8 +328,8 @@ bool ParseDriverPoseV2(std::ifstream& stream, SessionData* session, std::string*
     }
 
     SessionData result;
-    result.format_version = SessionFileVersion::DriverPoseV2;
-    result.poses_are_driver_space = true;
+    result.format_version = format_version;
+    result.poses_are_driver_space = poses_are_driver_space;
     result.trackers.resize(device_count);
     result.samples_by_tracker.resize(device_count);
 
@@ -436,6 +467,26 @@ bool ParseDriverPoseV2(std::ifstream& stream, SessionData* session, std::string*
     *session = std::move(result);
     return true;
 }
+
+bool ParseDriverPoseV2(std::ifstream& stream, SessionData* session, std::string* error)
+{
+    return ParsePoseChannelSession(
+        stream,
+        session,
+        error,
+        SessionFileVersion::DriverPoseV2,
+        true);
+}
+
+bool ParseCalibratedStandingPoseV3(std::ifstream& stream, SessionData* session, std::string* error)
+{
+    return ParsePoseChannelSession(
+        stream,
+        session,
+        error,
+        SessionFileVersion::CalibratedStandingPoseV3,
+        false);
+}
 }  // namespace
 
 SessionWriter::~SessionWriter()
@@ -486,8 +537,13 @@ bool SessionWriter::WriteHeader(
 
     stream_ << "SVRCAP" << kTab << static_cast<std::uint32_t>(version_) << "\n";
 
-    if (version_ == SessionFileVersion::DriverPoseV2)
+    if (version_ == SessionFileVersion::DriverPoseV2 || version_ == SessionFileVersion::CalibratedStandingPoseV3)
     {
+        if (version_ == SessionFileVersion::CalibratedStandingPoseV3)
+        {
+            stream_ << kPoseSpaceKey << kTab << kAppStandingPoseSpaceValue << "\n";
+        }
+
         stream_ << "DEVICES" << kTab << trackers.size() << "\n";
         for (std::size_t index = 0; index < trackers.size(); ++index)
         {
@@ -545,7 +601,7 @@ bool SessionWriter::WriteSample(const std::size_t tracker_index, const PoseSampl
         return false;
     }
 
-    if (version_ == SessionFileVersion::DriverPoseV2)
+    if (version_ == SessionFileVersion::DriverPoseV2 || version_ == SessionFileVersion::CalibratedStandingPoseV3)
     {
         stream_ << "POSE" << kTab << sample.timestamp_ns << kTab << tracker_index << kTab << sample.pose_time_offset_s;
         WriteDoubleArray(stream_, sample.position_m);
@@ -646,6 +702,9 @@ bool LoadSessionFile(const std::filesystem::path& path, SessionData* session, st
 
     case SessionFileVersion::DriverPoseV2:
         return ParseDriverPoseV2(stream, session, error);
+
+    case SessionFileVersion::CalibratedStandingPoseV3:
+        return ParseCalibratedStandingPoseV3(stream, session, error);
 
     default:
         if (error != nullptr)

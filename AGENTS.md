@@ -19,7 +19,9 @@ The project is intentionally split into two OpenVR layers:
      - shared OpenVR helpers used by the broker for live driver-pose capture metadata
    - Enumerates real HMD, controller, and tracker devices from SteamVR.
    - Captures tracking-space metadata and device descriptors.
-   - The legacy CLI path still records sampled standing-space tracker poses.
+   - The CLI recorder now has two practical modes:
+     - `legacy_tracker`: sampled standing-space tracker poses
+     - `app_standing_calibrated`: sampled `TrackingUniverseStanding` poses for HMD/controller/tracker, intended for Unity-side playback in a calibrated world space
 
 2. `replay-driver`
    - OpenVR driver layer (`openvr_driver.h`)
@@ -42,7 +44,9 @@ The project is intentionally split into two OpenVR layers:
    - Browses `.svrcap` session files, accepts direct path entry, supports clipboard paste and desktop drag-drop.
    - Mirrors the same UI into a desktop window.
    - Writes replay control state into `vrsettings` so the replay driver can hot-reload the selected session without hard-coded config edits.
-   - Starts and stops broker-driven recording directly, saving new recordings into the current session directory.
+   - Starts and stops recording directly, saving new recordings into the current session directory.
+   - `driver_pose` recording is broker-driven.
+   - `app_standing_calibrated` recording is handled by spawning the sibling `steamvr_capture_recorder.exe`; broker does not own calibrated recording anymore.
    - Exposes replay transport controls, live mode switching, and configurable recording interval.
 
 5. `hotpatch-broker` and `steamvr hotpatch dll`
@@ -66,6 +70,8 @@ The project is intentionally split into two OpenVR layers:
 - Replay mode still prefers real trackers to be powered off unless the hotpatch path is intentionally being used for `suppress` or `replace`.
 - The no-restart hotpatch path is experimental and unsupported by Valve. Keep heavy logic out of the injected DLL; session parsing and transport control belong in the broker.
 - Current live matching is session-driven. If a v2 session contains HMD or controller serials, `suppress` and `replace` will currently target those devices too. This can disrupt the active headset view and controller tracking and is a known limitation until per-class replay filtering is added.
+- Unity's `.svrcap` importer is allowed to ignore a single truncated final `POSE` or `SAMPLE` line. This is only to tolerate files interrupted by `Ctrl-C`; mid-file corruption should still fail import.
+- The CLI recorder should treat `Ctrl-C` as a graceful stop request: finish the current sampling pass, flush the writer, and then exit. Do not leave partially written pose rows on normal console interruption.
 
 ## Shell Execution
 
@@ -77,11 +83,14 @@ The project is intentionally split into two OpenVR layers:
 - CMake workspace with vendored OpenVR SDK under `third_party/openvr`.
 - Text-based session format for bootstrapping end-to-end flow quickly.
 - Session v2 stores full `DriverPose_t` pose semantics plus tracking-space metadata.
+- Session v3 stores calibrated standing-space poses for Unity-side playback without requiring Space Calibrator to be present at playback time.
 - CLI recorder that can list trackers, record for a fixed duration, or record until an external stop event is signaled.
 - Recorder uses target-time scheduling instead of naive fixed sleeps, and currently defaults to a 10 ms interval.
+- Recorder `--list` is expected to show HMD, controller, and tracker devices for calibrated recording diagnostics.
 - SteamVR replay driver that hot-reloads the selected session file and exposes virtual trackers.
 - SteamVR dashboard overlay for choosing a session root or direct replay file path inside VR, with desktop mirror support.
 - Overlay-driven broker recording with session-directory output, replay transport controls, live mode switching, and configurable recording interval.
+- Unity example project imports `.svrcap` assets directly and provides debug-target playback for v1/v2/v3 sessions.
 - Experimental no-restart live hook path with `passthrough / suppress / replace`.
 - No interpolation, compression, or editing tools yet.
 

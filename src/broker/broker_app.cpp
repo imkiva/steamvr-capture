@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -249,8 +250,11 @@ int BrokerApp::Run(const bool once)
             AdvancePlayback(now);
             CaptureRecordingSamples(now);
             UpdateSharedState();
-            const bool should_inject =
-                recording_active_ || (playback_active_ && live_mode_ != hotpatch::LiveMode::Passthrough);
+            const bool playback_requires_injection =
+                playback_active_ &&
+                live_mode_ != hotpatch::LiveMode::Passthrough &&
+                !(live_mode_ == hotpatch::LiveMode::Replace && !loaded_session_.poses_are_driver_space);
+            const bool should_inject = recording_active_ || playback_requires_injection;
             if (should_inject)
             {
                 std::string inject_error;
@@ -428,11 +432,11 @@ bool BrokerApp::EnsureOpenVr(std::string* error)
 {
     if (openvr_initialized_)
     {
-        return vr::VRSettings() != nullptr;
+        return vr_system_ != nullptr && vr_settings_ != nullptr;
     }
 
     vr::EVRInitError init_error = vr::VRInitError_None;
-    vr::IVRSystem* system = vr::VR_Init(&init_error, vr::VRApplication_Utility);
+    vr::IVRSystem* system = vr::VR_Init(&init_error, vr::VRApplication_Background);
     if (system == nullptr || init_error != vr::VRInitError_None)
     {
         if (error != nullptr)
@@ -442,7 +446,20 @@ bool BrokerApp::EnsureOpenVr(std::string* error)
         return false;
     }
 
-    (void)system;
+    vr_system_ = system;
+    vr_settings_ = vr::VRSettings();
+    if (vr_settings_ == nullptr)
+    {
+        if (error != nullptr)
+        {
+            *error = "OpenVR settings interface was unavailable after initialization.";
+        }
+        vr::VR_Shutdown();
+        vr_system_ = nullptr;
+        vr_settings_ = nullptr;
+        return false;
+    }
+
     openvr_initialized_ = true;
     openvr_target_pid_ = target_pid_;
     return true;
@@ -455,6 +472,8 @@ void BrokerApp::ShutdownOpenVr()
         vr::VR_Shutdown();
         openvr_initialized_ = false;
     }
+    vr_system_ = nullptr;
+    vr_settings_ = nullptr;
     openvr_target_pid_ = 0u;
 }
 
@@ -595,11 +614,11 @@ void BrokerApp::PollRecordingState(const std::chrono::steady_clock::time_point n
 
 bool BrokerApp::BeginRecording(const std::filesystem::path& output_path, std::string* error)
 {
-    if (!openvr_initialized_ || vr::VRSystem() == nullptr || vr::VRSettings() == nullptr)
+    if (!openvr_initialized_ || vr_system_ == nullptr || vr_settings_ == nullptr)
     {
         if (error != nullptr)
         {
-            *error = "SteamVR is not ready for driver-pose recording.";
+            *error = "SteamVR is not ready for recording.";
         }
         return false;
     }
@@ -613,7 +632,7 @@ bool BrokerApp::BeginRecording(const std::filesystem::path& output_path, std::st
         return false;
     }
 
-    const auto devices = capture::EnumerateRecordableDevices(*vr::VRSystem(), *vr::VRSettings());
+    const auto devices = capture::EnumerateRecordableDevices(*vr_system_, *vr_settings_);
     if (devices.empty())
     {
         if (error != nullptr)
@@ -644,7 +663,7 @@ bool BrokerApp::BeginRecording(const std::filesystem::path& output_path, std::st
         recording_serials_.push_back(Utf8ToWide(device.descriptor.serial));
     }
 
-    recording_tracking_space_ = capture::CaptureTrackingSpaceSnapshot(*vr::VRSystem());
+    recording_tracking_space_ = capture::CaptureTrackingSpaceSnapshot(*vr_system_);
     if (!recording_writer_.Open(output_path, session::SessionFileVersion::DriverPoseV2, error) ||
         !recording_writer_.WriteHeader(recording_devices_, recording_tracking_space_, error))
     {
@@ -685,7 +704,12 @@ void BrokerApp::EndRecording(const std::string& status_text)
 
 void BrokerApp::CaptureRecordingSamples(const std::chrono::steady_clock::time_point now)
 {
-    if (!recording_active_ || shared_state_ == nullptr || recording_devices_.empty())
+    if (!recording_active_ || recording_devices_.empty())
+    {
+        return;
+    }
+
+    if (shared_state_ == nullptr)
     {
         return;
     }
@@ -699,12 +723,12 @@ void BrokerApp::CaptureRecordingSamples(const std::chrono::steady_clock::time_po
         for (std::size_t device_index = 0; device_index < recording_devices_.size(); ++device_index)
         {
             session::PoseSample sample;
+            bool observed = false;
             sample.timestamp_ns = timestamp_ns;
             sample.world_from_driver_rotation_wxyz = {1.0, 0.0, 0.0, 0.0};
             sample.driver_from_head_rotation_wxyz = {1.0, 0.0, 0.0, 0.0};
 
             const std::wstring& serial = recording_serials_[device_index];
-            bool observed = false;
             const std::uint32_t observed_count = std::min<std::uint32_t>(
                 shared_state_->observed_device_count,
                 hotpatch::kMaxObservedDevices);
@@ -766,6 +790,7 @@ void BrokerApp::CaptureRecordingSamples(const std::chrono::steady_clock::time_po
 
             if (!observed)
             {
+                sample.timestamp_ns = timestamp_ns;
                 sample.pose_valid = false;
                 sample.device_connected = false;
                 sample.tracking_result = static_cast<std::int32_t>(vr::TrackingResult_Uninitialized);
@@ -927,7 +952,7 @@ void BrokerApp::UpdateLivePoseSlots()
 
     ClearLivePoseSlots();
 
-    if (live_mode_ != hotpatch::LiveMode::Replace || !playback_active_)
+    if (live_mode_ != hotpatch::LiveMode::Replace || !playback_active_ || !loaded_session_.poses_are_driver_space)
     {
         return;
     }
@@ -1042,7 +1067,13 @@ void BrokerApp::UpdateSharedState()
     }
     else
     {
-        if (live_mode_ == hotpatch::LiveMode::Replace)
+        if (live_mode_ == hotpatch::LiveMode::Replace && !loaded_session_.poses_are_driver_space)
+        {
+            CopyWideText(
+                shared_state_->broker_status_text,
+                L"Broker active. Replace is disabled for calibrated standing-pose sessions.");
+        }
+        else if (live_mode_ == hotpatch::LiveMode::Replace)
         {
             CopyWideText(shared_state_->broker_status_text, L"Broker active. Streaming recorded poses into the hotpatch table.");
         }

@@ -40,6 +40,17 @@ namespace SteamVRCapture.UnityExample
             generatedTargetsBySerial.Clear();
         }
 
+        private void OnValidate()
+        {
+            if (session == null)
+            {
+                return;
+            }
+
+            RebuildDebugTargets();
+            ApplyCurrentFrame();
+        }
+
         private void Update()
         {
             if (session == null)

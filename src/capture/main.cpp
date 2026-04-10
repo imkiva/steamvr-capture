@@ -1,4 +1,5 @@
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -21,8 +22,49 @@
 
 namespace
 {
+std::atomic<bool> g_console_stop_requested = false;
+
+BOOL WINAPI ConsoleCtrlHandler(const DWORD ctrl_type)
+{
+    switch (ctrl_type)
+    {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+        g_console_stop_requested.store(true, std::memory_order_relaxed);
+        return TRUE;
+
+    default:
+        return FALSE;
+    }
+}
+
+struct ConsoleCtrlHandlerGuard
+{
+    ConsoleCtrlHandlerGuard()
+    {
+        installed = SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE) != FALSE;
+    }
+
+    ~ConsoleCtrlHandlerGuard()
+    {
+        if (installed)
+        {
+            SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        }
+    }
+
+    bool installed = false;
+};
+
 struct Options
 {
+    enum class RecordMode
+    {
+        LegacyTrackers,
+        AppStandingCalibrated,
+    };
+
     bool list_only = false;
     std::filesystem::path record_path;
     std::filesystem::path pretty_print_path;
@@ -31,6 +73,8 @@ struct Options
     std::wstring until_event_name;
     double duration_seconds = 10.0;
     double interval_ms = steamvr_capture::replay_settings::kDefaultRecordIntervalMs;
+    RecordMode record_mode = RecordMode::LegacyTrackers;
+    bool verbose = false;
 };
 
 void PrintUsage()
@@ -38,7 +82,7 @@ void PrintUsage()
     std::cout
         << "Usage:\n"
         << "  steamvr_capture_recorder --list\n"
-        << "  steamvr_capture_recorder --record <file> [--duration <seconds>] [--interval-ms <ms>] [--until-event <name>]\n"
+        << "  steamvr_capture_recorder --record <file> [--record-mode <legacy_tracker|app_standing_calibrated>] [--duration <seconds>] [--interval-ms <ms>] [--until-event <name>] [--verbose]\n"
         << "  steamvr_capture_recorder --pretty-print <file>\n"
         << "  steamvr_capture_recorder --pretty-print-csv <file> [--output <file>]\n";
 }
@@ -54,6 +98,28 @@ bool ParseDouble(const std::string& text, double* value)
     {
         return false;
     }
+}
+
+bool ParseRecordMode(const std::string& text, Options::RecordMode* mode)
+{
+    if (mode == nullptr)
+    {
+        return false;
+    }
+
+    if (text == "legacy_tracker")
+    {
+        *mode = Options::RecordMode::LegacyTrackers;
+        return true;
+    }
+
+    if (text == "app_standing_calibrated")
+    {
+        *mode = Options::RecordMode::AppStandingCalibrated;
+        return true;
+    }
+
+    return false;
 }
 
 std::wstring Utf8ToWide(const std::string& text)
@@ -101,6 +167,15 @@ bool ParseOptions(const int argc, char** argv, Options* options)
                 return false;
             }
             options->record_path = argv[++index];
+            continue;
+        }
+
+        if (arg == "--record-mode")
+        {
+            if (index + 1 >= argc || !ParseRecordMode(argv[++index], &options->record_mode))
+            {
+                return false;
+            }
             continue;
         }
 
@@ -159,6 +234,12 @@ bool ParseOptions(const int argc, char** argv, Options* options)
                 return false;
             }
             options->until_event_name = Utf8ToWide(argv[++index]);
+            continue;
+        }
+
+        if (arg == "--verbose")
+        {
+            options->verbose = true;
             continue;
         }
 
@@ -346,6 +427,13 @@ bool PrettyPrintSessionFile(const std::filesystem::path& path, std::string* erro
         {
             std::cout << "Line " << line_number << " [DEVICE_COUNT] "
                       << "count=" << tokens[1] << "\n";
+            continue;
+        }
+
+        if (kind == "POSE_SPACE" && tokens.size() == 2)
+        {
+            std::cout << "Line " << line_number << " [POSE_SPACE] "
+                      << "mode=" << tokens[1] << "\n";
             continue;
         }
 
@@ -636,6 +724,12 @@ bool PrettyPrintSessionFileCsv(
             continue;
         }
 
+        if (kind == "POSE_SPACE" && tokens.size() == 2)
+        {
+            WriteCsvRow(output, {std::to_string(line_number), "POSE_SPACE", "", "", "", "", "", "", "", "", "", "", tokens[1], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
+            continue;
+        }
+
         if (kind == "TRACKER" && tokens.size() == 6)
         {
             WriteCsvRow(output, {std::to_string(line_number), "TRACKER", "", "", "", "", "", tokens[1], tokens[2], tokens[3], tokens[4], "", "", tokens[5], "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", line});
@@ -789,21 +883,52 @@ void PrintTrackers(const std::vector<steamvr_capture::capture::TrackerSnapshot>&
 {
     if (trackers.empty())
     {
-        std::cout << "No SteamVR generic trackers are currently available.\n";
+        std::cout << "No matching SteamVR devices are currently available.\n";
         return;
     }
 
-    std::cout << "Discovered trackers:\n";
+    const auto class_name = [](const std::int32_t device_class) -> const char*
+    {
+        switch (static_cast<vr::ETrackedDeviceClass>(device_class))
+        {
+        case vr::TrackedDeviceClass_HMD:
+            return "HMD";
+        case vr::TrackedDeviceClass_Controller:
+            return "Controller";
+        case vr::TrackedDeviceClass_GenericTracker:
+            return "Tracker";
+        case vr::TrackedDeviceClass_TrackingReference:
+            return "TrackingReference";
+        default:
+            return "Unknown";
+        }
+    };
+
+    std::cout << "Discovered devices:\n";
     for (const auto& tracker : trackers)
     {
         std::cout
             << "  index=" << tracker.device_index
+            << " class=" << class_name(tracker.descriptor.device_class)
+            << "(" << tracker.descriptor.device_class << ")"
             << " serial=" << tracker.descriptor.serial
             << " tracking_system=" << tracker.descriptor.tracking_system
             << " model=" << tracker.descriptor.model_number
+            << " manufacturer=" << (tracker.descriptor.manufacturer_name.empty() ? "<unset>" : tracker.descriptor.manufacturer_name)
+            << " controller_type=" << (tracker.descriptor.controller_type.empty() ? "<unset>" : tracker.descriptor.controller_type)
             << " role=" << (tracker.descriptor.role.empty() ? "<unset>" : tracker.descriptor.role)
             << "\n";
     }
+}
+
+void LogVerbose(const bool enabled, const std::string& message)
+{
+    if (!enabled)
+    {
+        return;
+    }
+
+    std::cout << "[recorder] " << message << "\n";
 }
 }  // namespace
 
@@ -851,6 +976,8 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    const bool calibrated_recording = options.record_mode == Options::RecordMode::AppStandingCalibrated;
+
     vr::EVRInitError init_error = vr::VRInitError_None;
     vr::IVRSystem* vr_system = vr::VR_Init(&init_error, vr::VRApplication_Background);
     if (init_error != vr::VRInitError_None || vr_system == nullptr)
@@ -870,7 +997,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    const auto trackers = steamvr_capture::capture::EnumerateTrackers(*vr_system, *settings);
+    LogVerbose(options.verbose, "OpenVR initialized successfully.");
+
+    const auto trackers = (options.list_only || calibrated_recording)
+        ? steamvr_capture::capture::EnumerateRecordableDevices(*vr_system, *settings)
+        : steamvr_capture::capture::EnumerateTrackers(*vr_system, *settings);
+    LogVerbose(options.verbose, "Enumerated " + std::to_string(trackers.size()) + " devices.");
     PrintTrackers(trackers);
 
     if (options.list_only)
@@ -880,7 +1012,7 @@ int main(int argc, char** argv)
 
     if (trackers.empty())
     {
-        std::cerr << "Cannot record because no generic trackers were detected.\n";
+        std::cerr << "Cannot record because no matching devices were detected.\n";
         return 1;
     }
 
@@ -893,13 +1025,29 @@ int main(int argc, char** argv)
 
     steamvr_capture::session::SessionWriter writer;
     std::string error;
-    if (!writer.Open(options.record_path, &error) || !writer.WriteHeader(descriptors, &error))
+    const auto session_version = calibrated_recording
+        ? steamvr_capture::session::SessionFileVersion::CalibratedStandingPoseV3
+        : steamvr_capture::session::SessionFileVersion::LegacyV1;
+    const auto tracking_space = calibrated_recording
+        ? steamvr_capture::session::TrackingSpaceSnapshot{}
+        : steamvr_capture::session::TrackingSpaceSnapshot{};
+    if (calibrated_recording)
+    {
+        LogVerbose(
+            options.verbose,
+            "Using app_standing_calibrated recording without tracking-space snapshot; poses are recorded directly in "
+            "TrackingUniverseStanding space.");
+    }
+    if (!writer.Open(options.record_path, session_version, &error) ||
+        !writer.WriteHeader(descriptors, tracking_space, &error))
     {
         std::cerr << error << "\n";
         return 1;
     }
 
     std::vector<vr::TrackedDevicePose_t> poses(vr::k_unMaxTrackedDeviceCount);
+    g_console_stop_requested.store(false, std::memory_order_relaxed);
+    ConsoleCtrlHandlerGuard console_ctrl_handler_guard;
     struct TimerResolutionGuard
     {
         TimerResolutionGuard()
@@ -937,6 +1085,11 @@ int main(int argc, char** argv)
 
     while (true)
     {
+        if (g_console_stop_requested.load(std::memory_order_relaxed))
+        {
+            break;
+        }
+
         if (stop_event != nullptr && WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0)
         {
             break;
@@ -947,11 +1100,16 @@ int main(int argc, char** argv)
             break;
         }
 
+        LogVerbose(
+            options.verbose,
+            "Calling GetDeviceToAbsoluteTrackingPose(TrackingUniverseStanding) for " +
+                std::to_string(trackers.size()) + " selected devices.");
         vr_system->GetDeviceToAbsoluteTrackingPose(
             vr::TrackingUniverseStanding,
             0.0f,
             poses.data(),
             static_cast<std::uint32_t>(poses.size()));
+        LogVerbose(options.verbose, "GetDeviceToAbsoluteTrackingPose returned.");
 
         const auto now = std::chrono::steady_clock::now();
         const auto timestamp_ns =
@@ -966,12 +1124,30 @@ int main(int argc, char** argv)
             }
 
             steamvr_capture::session::PoseSample sample;
+            if (options.verbose)
+            {
+                const auto& descriptor = trackers[tracker_index].descriptor;
+                std::ostringstream stream;
+                stream << "Processing device slot=" << tracker_index
+                       << " device_index=" << device_index
+                       << " class=" << descriptor.device_class
+                       << " serial=" << descriptor.serial
+                       << " pose_valid=" << (poses[device_index].bPoseIsValid ? 1 : 0)
+                       << " connected=" << (poses[device_index].bDeviceIsConnected ? 1 : 0)
+                       << " tracking_result=" << static_cast<int>(poses[device_index].eTrackingResult);
+                LogVerbose(true, stream.str());
+            }
             steamvr_capture::capture::PopulateSampleFromPose(poses[device_index], timestamp_ns, &sample);
             if (!writer.WriteSample(tracker_index, sample, &error))
             {
                 std::cerr << error << "\n";
                 return 1;
             }
+        }
+
+        if (g_console_stop_requested.load(std::memory_order_relaxed))
+        {
+            break;
         }
 
         next_sample_time += interval;

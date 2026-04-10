@@ -11,6 +11,12 @@
 #include "hotpatch_shared/hotpatch_protocol.h"
 #include "session/session_format.h"
 
+namespace vr
+{
+class IVRSystem;
+class IVRSettings;
+}
+
 namespace steamvr_capture::broker
 {
 class BrokerApp
@@ -57,6 +63,8 @@ private:
     hotpatch::SharedState* shared_state_ = nullptr;
     bool shared_state_read_only_ = false;
     bool openvr_initialized_ = false;
+    vr::IVRSystem* vr_system_ = nullptr;
+    vr::IVRSettings* vr_settings_ = nullptr;
     std::uint32_t openvr_target_pid_ = 0u;
     std::filesystem::path hotpatch_dll_path_;
     std::uint32_t target_pid_ = 0u;

@@ -209,6 +209,7 @@ target_include_directories(steamvr_capture_overlay
 
 target_link_libraries(steamvr_capture_overlay
     PRIVATE
+        steamvr_capture_session
         "${OPENVR_LIBRARY}"
         gdi32
         user32

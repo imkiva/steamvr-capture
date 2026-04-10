@@ -8,14 +8,15 @@ namespace SteamVRCapture.UnityExample.Editor
 {
     public static class SteamVrCaptureExampleBootstrap
     {
-        private const string SampleSessionPath = "Assets/SteamVRCapture/Samples/example_session_v2.svrcap";
-        private const string CalibratedSampleSessionPath = "Assets/SteamVRCapture/Samples/example_session_v3_calibrated.svrcap";
+        private const string SampleSessionPath = "Assets/SteamVRCapture/Samples/larger-than-life.svrcap";
+        private const string CalibratedSampleSessionPath = "Assets/SteamVRCapture/Samples/test_app_standing.svrcap";
+        private const string TestAppStandingSessionPath = "Assets/SteamVRCapture/Samples/test_app_standing.svrcap";
         private const string SampleScenePath = "Assets/SteamVRCapture/Scenes/SteamVrCapturePreview.unity";
 
         [MenuItem("SteamVR Capture/Create Example Scene")]
         public static void CreateExampleScene()
         {
-            SteamVrCaptureSessionAsset session = AssetDatabase.LoadAssetAtPath<SteamVrCaptureSessionAsset>(SampleSessionPath);
+            SteamVrCaptureSessionAsset session = AssetDatabase.LoadAssetAtPath<SteamVrCaptureSessionAsset>(TestAppStandingSessionPath);
             if (session == null)
             {
                 throw new System.InvalidOperationException("Failed to load example session asset.");
@@ -53,8 +54,14 @@ namespace SteamVRCapture.UnityExample.Editor
         {
             LogImportedSession(SampleSessionPath);
             LogImportedSession(CalibratedSampleSessionPath);
+            LogImportedSession(TestAppStandingSessionPath);
 
             CreateExampleScene();
+        }
+
+        public static void LogTestAppStandingImport()
+        {
+            LogImportedSession(TestAppStandingSessionPath);
         }
 
         private static void LogImportedSession(string assetPath)

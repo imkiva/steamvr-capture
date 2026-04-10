@@ -434,7 +434,7 @@ void DeviceProvider::WritePlaybackStateSetting()
 
 bool DeviceProvider::ShouldPublishVirtualTrackers() const
 {
-    return live_mode_ != "replace";
+    return live_mode_ != "replace" || !session_.poses_are_driver_space;
 }
 
 bool DeviceProvider::IsTrackerDescriptor(const session::TrackerDescriptor& descriptor)

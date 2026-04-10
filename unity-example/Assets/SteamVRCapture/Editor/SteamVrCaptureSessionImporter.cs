@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace SteamVRCapture.UnityExample.Editor
 {
-    [ScriptedImporter(1, "svrcap")]
+    [ScriptedImporter(4, "svrcap")]
     public sealed class SteamVrCaptureSessionImporter : ScriptedImporter
     {
         public override void OnImportAsset(AssetImportContext ctx)
@@ -15,7 +15,8 @@ namespace SteamVRCapture.UnityExample.Editor
 
             try
             {
-                string absolutePath = Path.GetFullPath(ctx.assetPath);
+                string projectRoot = Path.GetDirectoryName(Application.dataPath) ?? string.Empty;
+                string absolutePath = Path.GetFullPath(Path.Combine(projectRoot, ctx.assetPath));
                 SteamVrCaptureSessionParser.ParseResult parsed = SteamVrCaptureSessionParser.ParseFile(absolutePath);
                 asset.SetImportedData(
                     parsed.formatVersion,

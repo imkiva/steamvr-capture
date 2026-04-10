@@ -23,6 +23,7 @@ constexpr char kLiveModeKey[] = "live_mode";
 
 constexpr char kSessionRootKey[] = "session_root";
 constexpr char kRecordIntervalMsKey[] = "record_interval_ms";
+constexpr char kRecordModeKey[] = "record_mode";
 constexpr char kRecordStateKey[] = "record_state";
 constexpr char kRecordOutputPathKey[] = "record_output_path";
 
