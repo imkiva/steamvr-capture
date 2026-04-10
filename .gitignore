@@ -1,6 +1,8 @@
 build/
 .vs/
 out/
+.idea/
+.tmp_spacecal/
 *.user
 *.VC.db
 *.VC.opendb
