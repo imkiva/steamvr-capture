@@ -5,9 +5,10 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
 ## Components
 
 - `steamvr_capture_recorder`
-  - CLI tool.
-  - Lists real SteamVR trackers.
-  - Legacy recorder path for fixed-duration standing-space tracker capture.
+  - CLI OpenVR app-layer capture tool.
+  - Lists real SteamVR tracked devices for diagnostics.
+  - Owns app-layer record sources: `legacy_tracker` for v1 tracker-only standing-space capture and `app_standing_calibrated` for v3 calibrated app-standing HMD/controller/tracker capture.
+  - Does not write broker-driven v2 `driver_pose` sessions; that record source belongs to `steamvr_capture_broker`.
   - Skips this project's own virtual replay trackers so replay output is never re-recorded by mistake.
 
 - `driver_steamvr_capture_replay`
@@ -17,7 +18,7 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
 
 - `steamvr_capture_session`
   - Shared file format and parser/writer library.
-  - Supports legacy v1 tracker sessions and v2 full `DriverPose_t` pose-channel sessions.
+  - Supports legacy v1 tracker sessions, v2 broker-driven full `DriverPose_t` pose-channel sessions, and v3 recorder-driven app-standing calibrated sessions.
 
 - `steamvr_capture_overlay`
   - SteamVR dashboard overlay application.
@@ -25,7 +26,9 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
   - Writes replay selection into SteamVR settings so the replay driver hot-reloads the chosen session.
   - Mirrors the same UI into a desktop window with mouse input, `Ctrl+V`, and Explorer drag-drop.
   - Exposes explicit replay transport controls: `Play`, `Pause`, `Stop`, and `Loop`.
-  - Starts and stops broker-driven recording directly from the overlay.
+  - Starts and stops recording directly from the overlay.
+  - Uses the broker for `Record Mode = Driver`.
+  - Uses an armed confirmation step for `Record Mode = Calibrated`: first click arms recording, then both controller triggers or a second `Start Rec` click starts the external recorder.
   - Lets you configure the recording interval.
 
 - `steamvr_capture_broker` and `steamvr_capture_hotpatch.dll`
@@ -44,7 +47,7 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
 
 ## Current Session Format
 
-The current implementation uses a text bootstrap format so the recorder and driver can be connected quickly.
+The current implementation uses a text bootstrap format so the recorder, broker, and driver can be connected quickly.
 
 - v1 header: `SVRCAP<TAB>1`
 - v1 tracker lines: `TRACKER<TAB>index<TAB>serial<TAB>tracking_system<TAB>model<TAB>role`
@@ -173,12 +176,16 @@ build/runtime/tools/steamvr_capture_recorder.exe --pretty-print-csv sessions\wal
 
 The recorder currently defaults to `10.0 ms`. That matches the SteamVR Tracking 2.0 rate the project is currently targeting. The overlay exposes this value so you can tune it per session.
 
-The CLI recorder supports:
+`steamvr_capture_recorder.exe` is not a legacy-only binary. It owns the OpenVR application-layer record sources:
 
 - `--record-mode legacy_tracker` for legacy v1 tracker-only standing-pose sessions.
 - `--record-mode app_standing_calibrated` for v3 app-standing calibrated HMD/controller/tracker sessions intended for Unity playback.
 
-The overlay's `Record Mode = Driver` path uses the broker to write v2 full driver-pose sessions. The overlay's `Record Mode = Calibrated` path spawns `steamvr_capture_recorder.exe` and writes v3 sessions.
+Broker-driven `driver_pose` recording is a separate record source owned by `steamvr_capture_broker`, not by the recorder exe.
+
+The overlay's `Record Mode = Driver` path uses the broker to write v2 full driver-pose sessions immediately after `Start Rec`.
+
+The overlay's `Record Mode = Calibrated` path writes v3 sessions through `steamvr_capture_recorder.exe`, but it does not spawn the recorder on the first click. The first `Start Rec` click arms recording. Recording starts only after both hand controller triggers are held together, or after `Start Rec` is clicked a second time for desktop/no-VR testing. The overlay plays a system beep once the external recorder is spawned.
 
 ## Manual Registration For Development
 
@@ -219,6 +226,11 @@ The overlay supports both VR and desktop use.
 - `Start Rec / Stop Rec`: start or stop recording directly from the overlay.
 
 `Start Rec` saves into the current session directory. If a direct-path session is active, the new recording is saved next to that file.
+
+Recording behavior depends on `Record Mode`:
+
+- `Driver`: `Start Rec` begins broker-driven v2 recording immediately.
+- `Calibrated`: the first `Start Rec` arms v3 recording, `Stop Rec` cancels while armed, and recording begins after both hand controller triggers are held together or `Start Rec` is clicked again. A beep confirms that `steamvr_capture_recorder.exe` has been launched.
 
 ## Live Hook Notes
 
