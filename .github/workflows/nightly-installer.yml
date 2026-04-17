@@ -1,0 +1,110 @@
+name: Nightly Installer
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-installer
+  cancel-in-progress: true
+
+jobs:
+  build-installer:
+    name: Build installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure and build installer
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (
+            echo Visual Studio with C++ tools was not found.
+            exit /b 1
+          )
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target steamvr_capture_installer --parallel
+
+      - name: Rename installer with commit hash
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Get-ChildItem -LiteralPath build\installer -Filter 'SteamVRCaptureSetup-*.exe' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw 'No SteamVR Capture installer was generated.'
+          }
+
+          $assetName = 'SteamVRCapture-${{ github.sha }}.exe'
+          $assetPath = Join-Path $pwd $assetName
+          Copy-Item -LiteralPath $installer.FullName -Destination $assetPath -Force
+
+          "installer_name=$assetName" >> $env:GITHUB_OUTPUT
+          "installer_path=$assetPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.installer_name }}
+          path: ${{ steps.package.outputs.installer_path }}
+          if-no-files-found: error
+
+      - name: Publish nightly release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-Native {
+            param(
+              [Parameter(Mandatory = $true)]
+              [string] $FilePath,
+              [Parameter(ValueFromRemainingArguments = $true)]
+              [string[]] $Arguments
+            )
+
+            & $FilePath @Arguments
+            if ($LASTEXITCODE -ne 0) {
+              throw "$FilePath failed with exit code $LASTEXITCODE."
+            }
+          }
+
+          $tag = 'nightly'
+          $sha = '${{ github.sha }}'
+          $assetPath = '${{ steps.package.outputs.installer_path }}'
+
+          Invoke-Native git config user.name 'github-actions[bot]'
+          Invoke-Native git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          Invoke-Native git tag -f $tag $sha
+          Invoke-Native git push origin "refs/tags/$tag" --force
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          $notes = @"
+          Automated nightly installer build.
+
+          Commit: $sha
+          "@
+
+          if ($releaseExists) {
+            Invoke-Native gh release edit $tag --repo $env:GITHUB_REPOSITORY --title 'Nightly Build' --notes $notes --prerelease
+          } else {
+            Invoke-Native gh release create $tag --repo $env:GITHUB_REPOSITORY --title 'Nightly Build' --notes $notes --prerelease --target $sha
+          }
+
+          Invoke-Native gh release upload $tag $assetPath --repo $env:GITHUB_REPOSITORY --clobber
