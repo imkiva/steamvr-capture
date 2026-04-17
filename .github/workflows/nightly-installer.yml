@@ -26,36 +26,38 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure and build installer
-        shell: cmd
+        shell: bash
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
-          if not defined VSINSTALL (
-            echo Visual Studio with C++ tools was not found.
-            exit /b 1
-          )
-          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          set -euo pipefail
+
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --target steamvr_capture_installer --parallel
 
       - name: Rename installer with commit hash
         id: package
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          $installer = Get-ChildItem -LiteralPath build\installer -Filter 'SteamVRCaptureSetup-*.exe' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if (-not $installer) {
-            throw 'No SteamVR Capture installer was generated.'
-          }
+          set -euo pipefail
 
-          $assetName = 'SteamVRCapture-${{ github.sha }}.exe'
-          $assetPath = Join-Path $pwd $assetName
-          Copy-Item -LiteralPath $installer.FullName -Destination $assetPath -Force
+          shopt -s nullglob
+          installers=(build/installer/SteamVRCaptureSetup-*.exe)
+          if [ "${#installers[@]}" -eq 0 ]; then
+            echo "No SteamVR Capture installer was generated." >&2
+            exit 1
+          fi
 
-          "installer_name=$assetName" >> $env:GITHUB_OUTPUT
-          "installer_path=$assetPath" >> $env:GITHUB_OUTPUT
+          installer="$(ls -t "${installers[@]}" | head -n 1)"
+          asset_name="SteamVRCapture-${GITHUB_SHA}.exe"
+          cp "$installer" "$asset_name"
+
+          echo "installer_name=$asset_name" >> "$GITHUB_OUTPUT"
+          echo "installer_path=$asset_name" >> "$GITHUB_OUTPUT"
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
@@ -66,47 +68,26 @@ jobs:
 
       - name: Publish nightly release
         if: github.ref == 'refs/heads/main'
-        shell: pwsh
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          function Invoke-Native {
-            param(
-              [Parameter(Mandatory = $true)]
-              [string] $FilePath,
-              [Parameter(ValueFromRemainingArguments = $true)]
-              [string[]] $Arguments
-            )
+          set -euo pipefail
 
-            & $FilePath @Arguments
-            if ($LASTEXITCODE -ne 0) {
-              throw "$FilePath failed with exit code $LASTEXITCODE."
-            }
-          }
+          tag="nightly"
+          sha="${GITHUB_SHA}"
+          asset_path="${{ steps.package.outputs.installer_path }}"
+          notes="$(printf 'Automated nightly installer build.\n\nCommit: %s\n' "$sha")"
 
-          $tag = 'nightly'
-          $sha = '${{ github.sha }}'
-          $assetPath = '${{ steps.package.outputs.installer_path }}'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$tag" "$sha"
+          git push origin "refs/tags/$tag" --force
 
-          Invoke-Native git config user.name 'github-actions[bot]'
-          Invoke-Native git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          Invoke-Native git tag -f $tag $sha
-          Invoke-Native git push origin "refs/tags/$tag" --force
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "Nightly Build" --notes "$notes" --prerelease
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "Nightly Build" --notes "$notes" --prerelease --target "$sha"
+          fi
 
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          $releaseExists = $LASTEXITCODE -eq 0
-
-          $notes = @"
-          Automated nightly installer build.
-
-          Commit: $sha
-          "@
-
-          if ($releaseExists) {
-            Invoke-Native gh release edit $tag --repo $env:GITHUB_REPOSITORY --title 'Nightly Build' --notes $notes --prerelease
-          } else {
-            Invoke-Native gh release create $tag --repo $env:GITHUB_REPOSITORY --title 'Nightly Build' --notes $notes --prerelease --target $sha
-          }
-
-          Invoke-Native gh release upload $tag $assetPath --repo $env:GITHUB_REPOSITORY --clobber
+          gh release upload "$tag" "$asset_path" --repo "$GITHUB_REPOSITORY" --clobber
