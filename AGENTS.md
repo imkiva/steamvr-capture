@@ -76,6 +76,13 @@ The project is intentionally split into two OpenVR layers:
    - Inno Setup is the installer path. Do not add a zip portable packaging path unless explicitly requested.
    - CMake may download the `Tools.InnoSetup` NuGet package into `build/_deps/innosetup` and use its portable `tools/ISCC.exe` when no system `ISCC.exe` is found.
 
+7. `unity-example`
+   - Unity 2022.3 example project for importing `.svrcap` files as assets and previewing recorded pose tracks in play mode.
+   - Imports v1/v2/v3 session assets through Unity editor scripts.
+   - `SteamVrCapturePlayback` drives scene objects by reading `SteamVrCaptureTrackedDeviceTarget` helper components on its children.
+   - Tracker target identity must come from helper component fields, not from GameObject names, so users can freely rename target GameObjects.
+   - Runtime playback should ignore unknown or unmatched child objects instead of deleting them.
+
 ## Constraints
 
 - Do not mix `openvr.h` and `openvr_driver.h` inside the same binary.
@@ -94,6 +101,9 @@ The project is intentionally split into two OpenVR layers:
 - Keep overlay `driver_pose` recording immediate through the broker. Only `app_standing_calibrated` uses the armed waiting state and external recorder spawn.
 - The second `Start Rec` click while calibrated recording is armed is an intentional desktop/no-VR debug shortcut and should remain supported.
 - Do not describe `steamvr_capture_recorder.exe` as the legacy recorder. `legacy_tracker` is one recorder mode; recorder-vs-broker is a record-source boundary.
+- Unity playback must not use child GameObject names as tracker identifiers. Use `SteamVrCaptureTrackedDeviceTarget` data for runtime binding.
+- Unity playback must not recreate tracker target GameObjects on enter-play-mode or exit-play-mode. Recreate targets only when the session asset changes in the editor or when the user explicitly clicks an inspector maintenance button.
+- Unity playback's incremental update path must preserve unrelated child objects and ignore unknown/unmatched objects at runtime. Session-asset replacement is the only path that intentionally clears all children before rebuilding targets for the new session.
 
 ## Shell Execution
 
@@ -115,7 +125,7 @@ The project is intentionally split into two OpenVR layers:
 - Broker-owned `driver_pose` recording and recorder-owned app-layer recording are separate sources exposed through overlay record mode selection.
 - Overlay calibrated recording arms first, then starts from a both-trigger chord or a second `Start Rec` click, and launches the sibling CLI recorder with a confirmation beep.
 - Installer build via the `steamvr_capture_installer` CMake target. Installed users get driver registration and overlay auto-launch through `steamvr_capture_setup_helper.exe`.
-- Unity example project imports `.svrcap` assets directly and provides debug-target playback for v1/v2/v3 sessions.
+- Unity example project imports `.svrcap` assets directly and provides target-component-based playback for v1/v2/v3 sessions.
 - Experimental no-restart live hook path with `passthrough / suppress / replace`.
 - No interpolation, compression, or editing tools yet.
 

@@ -45,6 +45,10 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
   - Enables dashboard overlay auto-launch so the UI follows SteamVR startup.
   - Initializes the default session directory and non-destructive settings.
 
+- `unity-example`
+  - Unity 2022.3 example project for importing `.svrcap` files as assets and previewing recorded pose tracks in play mode.
+  - Uses explicit `SteamVrCaptureTrackedDeviceTarget` components to bind scene objects to recorded devices instead of using GameObject names as identifiers.
+
 ## Current Session Format
 
 The current implementation uses a text bootstrap format so the recorder, broker, and driver can be connected quickly.
@@ -186,6 +190,20 @@ Broker-driven `driver_pose` recording is a separate record source owned by `stea
 The overlay's `Record Mode = Driver` path uses the broker to write v2 full driver-pose sessions immediately after `Start Rec`.
 
 The overlay's `Record Mode = Calibrated` path writes v3 sessions through `steamvr_capture_recorder.exe`, but it does not spawn the recorder on the first click. The first `Start Rec` click arms recording. Recording starts only after both hand controller triggers are held together, or after `Start Rec` is clicked a second time for desktop/no-VR testing. The overlay plays a system beep once the external recorder is spawned.
+
+## Unity Example Playback
+
+The Unity example is under `unity-example/` and targets Unity `2022.3.22f1`.
+
+Import a `.svrcap` file into `Assets/` and assign the generated session asset to `SteamVrCapturePlayback`. The playback component creates child target GameObjects for the recorded devices, but runtime binding does not depend on those GameObject names. Each generated target has a `SteamVrCaptureTrackedDeviceTarget` component containing the recorded device identity: track index, serial, role, and device class. You can rename or reorganize generated targets as long as that helper component remains on the object.
+
+Target object lifecycle is intentionally conservative:
+
+- Changing the session asset in the editor clears the playback object's children and recreates targets for the new session.
+- Entering or exiting play mode does not recreate targets.
+- Runtime playback scans child `SteamVrCaptureTrackedDeviceTarget` components and ignores child objects that do not match any recorded device.
+- `Update Tracker GameObjects` incrementally creates missing target objects without deleting unknown children.
+- `Force Recreate Tracker GameObject` recreates managed target objects for the current session while preserving unrelated children.
 
 ## Manual Registration For Development
 
