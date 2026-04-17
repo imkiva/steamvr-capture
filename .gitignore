@@ -1,6 +1,7 @@
 build/
 .vs/
 out/
+dist/
 .idea/
 .tmp_spacecal/
 *.user

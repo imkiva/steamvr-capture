@@ -59,6 +59,19 @@ The project is intentionally split into two OpenVR layers:
      - `replace`: overwrite matching real device updates with recorded pose data
    - This path is intentionally separate from the replay driver because it is a runtime hook architecture, not a normal OpenVR driver lifecycle.
 
+6. `setup-helper` and installer
+   - OpenVR application/utility layer (`openvr.h`), never `openvr_driver.h`.
+   - Built as `steamvr_capture_setup_helper.exe`.
+   - Handles installed-user registration and repair:
+     - locate SteamVR and its own `vrpathreg.exe`
+     - register/unregister the replay driver
+     - generate the installed overlay `.vrmanifest`
+     - register/unregister the overlay app manifest
+     - enable overlay auto-launch with SteamVR
+     - initialize non-destructive defaults such as session root and record interval
+   - Inno Setup is the installer path. Do not add a zip portable packaging path unless explicitly requested.
+   - CMake may download the `Tools.InnoSetup` NuGet package into `build/_deps/innosetup` and use its portable `tools/ISCC.exe` when no system `ISCC.exe` is found.
+
 ## Constraints
 
 - Do not mix `openvr.h` and `openvr_driver.h` inside the same binary.
@@ -72,6 +85,8 @@ The project is intentionally split into two OpenVR layers:
 - Current live matching is session-driven. If a v2 session contains HMD or controller serials, `suppress` and `replace` will currently target those devices too. This can disrupt the active headset view and controller tracking and is a known limitation until per-class replay filtering is added.
 - Unity's `.svrcap` importer is allowed to ignore a single truncated final `POSE` or `SAMPLE` line. This is only to tolerate files interrupted by `Ctrl-C`; mid-file corruption should still fail import.
 - The CLI recorder should treat `Ctrl-C` as a graceful stop request: finish the current sampling pass, flush the writer, and then exit. Do not leave partially written pose rows on normal console interruption.
+- Installed runtime layout is rooted at the installer directory with sibling `tools/` and `steamvr_capture_replay/` directories. Overlay-launched helpers must be resolved relative to the overlay executable, not build-tree paths.
+- Installer registration should use SteamVR's installed `vrpathreg.exe`; do not bundle or call a copied `vrpathreg.exe`.
 
 ## Shell Execution
 
@@ -90,6 +105,7 @@ The project is intentionally split into two OpenVR layers:
 - SteamVR replay driver that hot-reloads the selected session file and exposes virtual trackers.
 - SteamVR dashboard overlay for choosing a session root or direct replay file path inside VR, with desktop mirror support.
 - Overlay-driven broker recording with session-directory output, replay transport controls, live mode switching, and configurable recording interval.
+- Installer build via the `steamvr_capture_installer` CMake target. Installed users get driver registration and overlay auto-launch through `steamvr_capture_setup_helper.exe`.
 - Unity example project imports `.svrcap` assets directly and provides debug-target playback for v1/v2/v3 sessions.
 - Experimental no-restart live hook path with `passthrough / suppress / replace`.
 - No interpolation, compression, or editing tools yet.
@@ -100,5 +116,5 @@ The project is intentionally split into two OpenVR layers:
 2. Replace the bootstrap text session format with a binary or chunked format once the data path is stable.
 3. Add interpolation for smoother replay between recorded samples.
 4. Harden live-hook observability with explicit logging, failure surfacing, and diagnostics.
-5. Add auto-launch behavior and tray integration after the base data path is reliable.
-6. Add tests for file parsing, pose conversion helpers, and live-mode matching logic.
+5. Add tray integration after the base data path is reliable.
+6. Add tests for file parsing, pose conversion helpers, setup-helper registration logic, and live-mode matching logic.

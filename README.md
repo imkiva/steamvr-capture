@@ -35,6 +35,13 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
     - `Suppress`
     - `Replace`
 
+- `steamvr_capture_setup_helper`
+  - Installer/repair helper.
+  - Registers the replay driver with SteamVR's own `vrpathreg.exe`.
+  - Generates and registers the overlay application manifest.
+  - Enables dashboard overlay auto-launch so the UI follows SteamVR startup.
+  - Initializes the default session directory and non-destructive settings.
+
 ## Current Session Format
 
 The current implementation uses a text bootstrap format so the recorder and driver can be connected quickly.
@@ -65,6 +72,10 @@ The current implementation uses a text bootstrap format so the recorder and driv
   - `willDriftInYaw`
   - `shouldApplyHeadModel`
 
+- v3 header: `SVRCAP<TAB>3`
+- v3 semantic: app-standing calibrated capture for Unity playback after Space Calibrator alignment.
+- v3 is written by `steamvr_capture_recorder --record-mode app_standing_calibrated`, not by the broker.
+
 This is a temporary bootstrap. The architecture document in `AGENTS.md` already reserves a later migration to a binary format.
 
 ## Build
@@ -80,16 +91,53 @@ Outputs:
 - Overlay: `build/runtime/tools/steamvr_capture_overlay.exe`
 - Broker: `build/runtime/tools/steamvr_capture_broker.exe`
 - Hotpatch DLL: `build/runtime/tools/steamvr_capture_hotpatch.dll`
+- Setup helper: `build/runtime/tools/steamvr_capture_setup_helper.exe`
 - Driver package root: `build/runtime/steamvr_capture_replay`
 
-## Packaging For Testers
+## Installer Packaging
 
-The runtime is intentionally laid out so you can zip the build output without rewriting hard-coded paths:
+Build the installer end-to-end:
 
-- `build/runtime/tools`
-- `build/runtime/steamvr_capture_replay`
+```powershell
+cmake -S . -B build -G Ninja
+cmake --build build --target steamvr_capture_installer
+```
 
-The overlay resolves the recorder and broker relative to its own executable directory, so testers can run the packaged tools directly after extracting the zip.
+If `ISCC.exe` is not available, CMake downloads the portable `Tools.InnoSetup` NuGet package into `build/_deps/innosetup` and uses its `tools/ISCC.exe`.
+
+The generated installer is:
+
+```text
+build\installer\SteamVRCaptureSetup-0.1.0.exe
+```
+
+Manual staging is still available with `cmake --install build --prefix dist/SteamVRCapture`.
+
+The installer targets:
+
+```text
+%LOCALAPPDATA%\Programs\SteamVRCapture
+```
+
+Post-install registration is handled by:
+
+```powershell
+%LOCALAPPDATA%\Programs\SteamVRCapture\tools\steamvr_capture_setup_helper.exe --install
+```
+
+The helper registers the replay driver, registers the dashboard overlay manifest, enables overlay auto-launch, and creates the default session directory:
+
+```text
+Documents\SteamVR Capture\Sessions
+```
+
+To inspect an installation:
+
+```powershell
+%LOCALAPPDATA%\Programs\SteamVRCapture\tools\steamvr_capture_setup_helper.exe --status
+```
+
+Uninstall runs the helper with `--uninstall` to remove SteamVR driver and overlay registrations. User recordings under Documents are left in place.
 
 ## Recorder Usage
 
@@ -125,11 +173,18 @@ build/runtime/tools/steamvr_capture_recorder.exe --pretty-print-csv sessions\wal
 
 The recorder currently defaults to `10.0 ms`. That matches the SteamVR Tracking 2.0 rate the project is currently targeting. The overlay exposes this value so you can tune it per session.
 
-The CLI recorder still writes legacy v1 standing-space tracker sessions. The overlay and broker record v2 full driver-pose sessions.
+The CLI recorder supports:
 
-## Driver Registration
+- `--record-mode legacy_tracker` for legacy v1 tracker-only standing-pose sessions.
+- `--record-mode app_standing_calibrated` for v3 app-standing calibrated HMD/controller/tracker sessions intended for Unity playback.
 
-Register the replay driver package with SteamVR:
+The overlay's `Record Mode = Driver` path uses the broker to write v2 full driver-pose sessions. The overlay's `Record Mode = Calibrated` path spawns `steamvr_capture_recorder.exe` and writes v3 sessions.
+
+## Manual Registration For Development
+
+Installed users should not need this section. The installer performs these steps through `steamvr_capture_setup_helper`.
+
+For development builds, register the replay driver package with SteamVR:
 
 ```powershell
 & "$env:ProgramFiles(x86)\Steam\steamapps\common\SteamVR\bin\win64\vrpathreg.exe" adddriver "$PWD\build\runtime\steamvr_capture_replay"
@@ -160,7 +215,8 @@ The overlay supports both VR and desktop use.
 - `Loop`: toggle looping.
 - `Live Mode`: cycle through `Suppress`, `Replace`, and `Passthrough`.
 - `Rec: <ms>`: configure the recording interval.
-- `Start Rec / Stop Rec`: start or stop broker-driven driver-pose recording directly from the overlay.
+- `Record Mode`: switch between broker-driven driver-pose recording and recorder.exe-driven calibrated app-standing recording.
+- `Start Rec / Stop Rec`: start or stop recording directly from the overlay.
 
 `Start Rec` saves into the current session directory. If a direct-path session is active, the new recording is saved next to that file.
 
@@ -189,4 +245,3 @@ Current limitation:
 - Recorder currently snapshots trackers that are present at capture start and does not remap reconnections by serial mid-session.
 - The live hook path is intentionally experimental and depends on current SteamVR runtime behavior.
 - Live `Suppress` / `Replace` currently match every recorded device class in a v2 session, including HMD and controllers.
-- No automatic startup orchestration yet.
