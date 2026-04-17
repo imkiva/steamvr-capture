@@ -53,7 +53,7 @@ jobs:
           fi
 
           installer="$(ls -t "${installers[@]}" | head -n 1)"
-          asset_name="SteamVRCapture-${GITHUB_SHA}.exe"
+          asset_name="SteamVRCapture-${GITHUB_SHA::7}.exe"
           cp "$installer" "$asset_name"
 
           echo "installer_name=$asset_name" >> "$GITHUB_OUTPUT"
