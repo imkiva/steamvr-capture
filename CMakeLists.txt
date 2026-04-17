@@ -308,6 +308,7 @@ target_link_libraries(steamvr_capture_overlay
         gdi32
         user32
         shell32
+        winmm
 )
 
 target_compile_definitions(steamvr_capture_overlay

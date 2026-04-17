@@ -45,6 +45,8 @@ constexpr float kOverlayWidthMeters = 1.6f;
 constexpr float kThumbnailWidthMeters = 0.32f;
 constexpr std::chrono::milliseconds kUiTickInterval(16);
 constexpr std::chrono::milliseconds kSettingsRefreshInterval(250);
+constexpr std::chrono::milliseconds kCalibratedTriggerHoldDuration(180);
+constexpr std::chrono::milliseconds kIgnoreVrClickAfterArmedStart(700);
 constexpr wchar_t kUiFontFace[] = L"Segoe UI";
 constexpr wchar_t kDesktopWindowClassName[] = L"SteamVRCaptureReplayDesktopWindow";
 constexpr std::array<float, 5> kRecordIntervalPresetsMs = {5.0f, 8.33f, 10.0f, 11.11f, 16.67f};
@@ -776,8 +778,11 @@ struct OverlayState
     bool recording_active = false;
     bool recording_start_pending = false;
     bool recording_stop_pending = false;
+    bool calibrated_record_armed = false;
     std::string recording_output_utf8;
     std::string recording_status = "Recorder idle.";
+    std::chrono::steady_clock::time_point calibrated_trigger_chord_started_at{};
+    std::chrono::steady_clock::time_point ignore_vr_clicks_until{};
     std::chrono::steady_clock::time_point last_settings_refresh{};
     KeyboardMode keyboard_mode = KeyboardMode::None;
     std::vector<Button> buttons;
@@ -976,8 +981,13 @@ struct OverlayApp::Impl
     std::wstring BuildRecorderStopEventName() const;
     void CloseRecorderHandles();
     bool StartRecording();
+    bool ArmCalibratedRecording();
+    bool SpawnCalibratedRecorderFromArm();
+    bool SpawnCalibratedRecorder(const std::filesystem::path& output_path);
     void StopRecording(bool refresh_sessions);
     void PollRecordingProcess();
+    void PollCalibratedRecordArm();
+    bool AreBothControllerTriggersDown() const;
     void PumpGlobalEvents();
     void PumpOverlayEvents(vr::VROverlayHandle_t overlay_handle);
     void HandleMouseButtonUp(LONG x, LONG y);
@@ -1305,9 +1315,19 @@ void OverlayApp::Impl::CloseRecorderHandles()
 
 bool OverlayApp::Impl::StartRecording()
 {
+    if (state.calibrated_record_armed)
+    {
+        return SpawnCalibratedRecorderFromArm();
+    }
+
     if (state.recording_active || state.recording_start_pending)
     {
         return true;
+    }
+
+    if (UsesExternalRecorderProcess(state.record_mode))
+    {
+        return ArmCalibratedRecording();
     }
 
     const std::filesystem::path recording_directory = ResolveRecordingDirectory();
@@ -1331,25 +1351,72 @@ bool OverlayApp::Impl::StartRecording()
     state.recording_output_utf8 = PathToUtf8(output_path);
     state.recording_status =
         std::string("Starting ") +
-        (UsesExternalRecorderProcess(state.record_mode) ? "calibrated standing-pose" : "driver-pose") +
-        " recording to " + state.recording_output_utf8;
+        "driver-pose recording to " + state.recording_output_utf8;
     state.status_text = "Recording session";
     state.last_error.clear();
     state.dirty = true;
 
-    if (!UsesExternalRecorderProcess(state.record_mode))
+    WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "recording");
+    return true;
+}
+
+bool OverlayApp::Impl::ArmCalibratedRecording()
+{
+    if (state.recording_active || state.recording_start_pending || state.recording_stop_pending)
     {
-        WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "recording");
         return true;
     }
 
+    const std::filesystem::path recording_directory = ResolveRecordingDirectory();
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(recording_directory, filesystem_error);
+    if (filesystem_error)
+    {
+        state.last_error = "Failed to create recording directory: " + recording_directory.string();
+        state.dirty = true;
+        return false;
+    }
+
+    const std::filesystem::path output_path = BuildRecordingFilename(recording_directory);
+    WriteSettingsString(
+        replay_settings::kOverlaySection,
+        replay_settings::kRecordOutputPathKey,
+        PathToUtf8(output_path));
     WriteSettingsString(replay_settings::kOverlaySection, replay_settings::kRecordStateKey, "stopped");
+
+    state.calibrated_record_armed = true;
+    state.recording_active = false;
+    state.recording_start_pending = false;
+    state.recording_stop_pending = false;
+    state.recording_output_utf8 = PathToUtf8(output_path);
+    state.recording_status =
+        "Calibrated recording armed. Press both triggers, or click Start Rec again, to begin.";
+    state.status_text = "Calibrated recorder armed";
+    state.last_error.clear();
+    state.calibrated_trigger_chord_started_at = {};
+    state.dirty = true;
+    return true;
+}
+
+bool OverlayApp::Impl::SpawnCalibratedRecorderFromArm()
+{
+    if (!state.calibrated_record_armed || state.recording_output_utf8.empty())
+    {
+        return false;
+    }
+
+    return SpawnCalibratedRecorder(Utf8Path(state.recording_output_utf8));
+}
+
+bool OverlayApp::Impl::SpawnCalibratedRecorder(const std::filesystem::path& output_path)
+{
     CloseRecorderHandles();
 
     const std::wstring stop_event_name = BuildRecorderStopEventName();
     recorder_stop_event = CreateEventW(nullptr, TRUE, FALSE, stop_event_name.c_str());
     if (recorder_stop_event == nullptr)
     {
+        state.calibrated_record_armed = false;
         state.recording_start_pending = false;
         state.recording_status = "Recorder idle.";
         state.status_text = "Recorder idle";
@@ -1373,6 +1440,7 @@ bool OverlayApp::Impl::StartRecording()
     if (!LaunchHiddenProcess(recorder_path, arguments, state.exe_path.parent_path(), &process_info, &launch_error))
     {
         CloseRecorderHandles();
+        state.calibrated_record_armed = false;
         state.recording_start_pending = false;
         state.recording_status = "Recorder idle.";
         state.status_text = "Recorder idle";
@@ -1384,11 +1452,34 @@ bool OverlayApp::Impl::StartRecording()
     recorder_process = process_info.hProcess;
     recorder_process_id = process_info.dwProcessId;
     CloseHandle(process_info.hThread);
+    state.calibrated_record_armed = false;
+    state.recording_active = false;
+    state.recording_start_pending = true;
+    state.recording_stop_pending = false;
+    state.recording_status = "Starting calibrated standing-pose recorder...";
+    state.status_text = "Recording session";
+    state.ignore_vr_clicks_until = std::chrono::steady_clock::now() + kIgnoreVrClickAfterArmedStart;
+    state.dirty = true;
+    PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC);
     return true;
 }
 
 void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
 {
+    if (state.calibrated_record_armed)
+    {
+        state.calibrated_record_armed = false;
+        state.recording_active = false;
+        state.recording_start_pending = false;
+        state.recording_stop_pending = false;
+        state.calibrated_trigger_chord_started_at = {};
+        state.recording_status = "Calibrated recording cancelled.";
+        state.status_text = "Recorder idle";
+        state.last_error.clear();
+        state.dirty = true;
+        return;
+    }
+
     if (!state.recording_active && !state.recording_start_pending)
     {
         return;
@@ -1429,6 +1520,11 @@ void OverlayApp::Impl::StopRecording(const bool refresh_sessions)
 
 void OverlayApp::Impl::PollRecordingProcess()
 {
+    if (state.calibrated_record_armed)
+    {
+        return;
+    }
+
     if (UsesExternalRecorderProcess(state.record_mode))
     {
         if (recorder_process == nullptr)
@@ -1536,6 +1632,81 @@ void OverlayApp::Impl::PollRecordingProcess()
     }
 }
 
+bool OverlayApp::Impl::AreBothControllerTriggersDown() const
+{
+    if (vr::VRSystem() == nullptr)
+    {
+        return false;
+    }
+
+    bool left_down = false;
+    bool right_down = false;
+    std::uint32_t triggered_controller_count = 0;
+    const std::uint64_t trigger_mask = vr::ButtonMaskFromId(vr::k_EButton_SteamVR_Trigger);
+
+    for (vr::TrackedDeviceIndex_t index = 0; index < vr::k_unMaxTrackedDeviceCount; ++index)
+    {
+        if (vr::VRSystem()->GetTrackedDeviceClass(index) != vr::TrackedDeviceClass_Controller)
+        {
+            continue;
+        }
+
+        vr::VRControllerState_t controller_state{};
+        if (!vr::VRSystem()->GetControllerState(index, &controller_state, sizeof(controller_state)))
+        {
+            continue;
+        }
+
+        bool trigger_down = (controller_state.ulButtonPressed & trigger_mask) != 0;
+        trigger_down = trigger_down || controller_state.rAxis[1].x > 0.75f;
+        if (!trigger_down)
+        {
+            continue;
+        }
+
+        ++triggered_controller_count;
+        const vr::ETrackedControllerRole role = vr::VRSystem()->GetControllerRoleForTrackedDeviceIndex(index);
+        if (role == vr::TrackedControllerRole_LeftHand)
+        {
+            left_down = true;
+        }
+        else if (role == vr::TrackedControllerRole_RightHand)
+        {
+            right_down = true;
+        }
+    }
+
+    return (left_down && right_down) || triggered_controller_count >= 2;
+}
+
+void OverlayApp::Impl::PollCalibratedRecordArm()
+{
+    if (!state.calibrated_record_armed || !UsesExternalRecorderProcess(state.record_mode))
+    {
+        return;
+    }
+
+    if (!AreBothControllerTriggersDown())
+    {
+        state.calibrated_trigger_chord_started_at = {};
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (state.calibrated_trigger_chord_started_at.time_since_epoch().count() == 0)
+    {
+        state.calibrated_trigger_chord_started_at = now;
+        return;
+    }
+
+    if ((now - state.calibrated_trigger_chord_started_at) < kCalibratedTriggerHoldDuration)
+    {
+        return;
+    }
+
+    SpawnCalibratedRecorderFromArm();
+}
+
 void OverlayApp::Impl::PumpWindowMessages()
 {
     MSG message{};
@@ -1634,6 +1805,8 @@ void OverlayApp::Impl::Shutdown()
     state.recording_active = false;
     state.recording_start_pending = false;
     state.recording_stop_pending = false;
+    state.calibrated_record_armed = false;
+    state.calibrated_trigger_chord_started_at = {};
     CloseHotpatchStateMapping();
     DestroyDesktopWindow();
 
@@ -1661,6 +1834,7 @@ int OverlayApp::Impl::Run()
     while (!state.quit_requested)
     {
         PumpWindowMessages();
+        PollCalibratedRecordArm();
         PollRecordingProcess();
         PumpGlobalEvents();
         PumpOverlayEvents(state.main_overlay);
@@ -1963,6 +2137,10 @@ void OverlayApp::Impl::PumpOverlayEvents(const vr::VROverlayHandle_t overlay_han
         case vr::VREvent_MouseButtonUp:
             if (overlay_handle == state.main_overlay && event.data.mouse.button == vr::VRMouseButton_Left)
             {
+                if (state.ignore_vr_clicks_until > std::chrono::steady_clock::now())
+                {
+                    break;
+                }
                 const LONG x = static_cast<LONG>(std::lround(event.data.mouse.x));
                 const LONG y = static_cast<LONG>(kMainHeight - 1 - std::lround(event.data.mouse.y));
                 HandleMouseButtonUp(x, y);
@@ -2106,7 +2284,8 @@ void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_
         return;
 
     case ButtonAction::CycleRecordMode:
-        if (state.recording_active || state.recording_start_pending || state.recording_stop_pending)
+        if (state.recording_active || state.recording_start_pending || state.recording_stop_pending ||
+            state.calibrated_record_armed)
         {
             state.last_error = "Stop recording before changing the record mode.";
             state.dirty = true;
@@ -2532,12 +2711,14 @@ void OverlayApp::Impl::RenderMainOverlay()
         RECT{920, 192, 1110, 244},
         ButtonAction::StartRecording,
         0,
+        state.calibrated_record_armed ? L"Confirm Rec" :
         state.recording_start_pending ? L"Starting..." :
             (state.recording_active ? (state.recording_stop_pending ? L"Stopping..." : L"Recording...") : L"Start Rec"));
     AddButton(
         RECT{1130, 192, 1280, 244},
         ButtonAction::StopRecording,
         0,
+        state.calibrated_record_armed ? L"Cancel Rec" :
         state.recording_stop_pending ? L"Stop Sent" : L"Stop Rec");
     AddButton(
         RECT{1300, 192, 1410, 244},
@@ -2613,7 +2794,9 @@ void OverlayApp::Impl::RenderMainOverlay()
     draw_runtime_line(L"Mode: " + LiveModeLabel(state.live_mode), RGB(133, 187, 237));
     draw_runtime_line(
         L"Recorder: " + Utf8ToWide(state.recording_status),
-        (state.recording_active || state.recording_start_pending) ? RGB(109, 204, 163) : RGB(172, 187, 205));
+        (state.recording_active || state.recording_start_pending || state.calibrated_record_armed)
+            ? RGB(109, 204, 163)
+            : RGB(172, 187, 205));
     if (!state.recording_output_utf8.empty())
     {
         draw_runtime_line(L"Output: " + Utf8ToWide(state.recording_output_utf8), RGB(140, 154, 173));
@@ -2753,10 +2936,15 @@ void OverlayApp::Impl::RenderThumbnailOverlay()
         RGB(218, 186, 97));
     state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(
-            Utf8ToWide(state.recording_start_pending ? "starting" : (state.recording_active ? "recording" : "recorder idle")),
+            Utf8ToWide(
+                state.calibrated_record_armed
+                    ? "armed"
+                    : (state.recording_start_pending ? "starting" : (state.recording_active ? "recording" : "recorder idle"))),
             28),
         RECT{26, 172, 374, 204},
-        (state.recording_active || state.recording_start_pending) ? RGB(109, 204, 163) : RGB(172, 187, 205));
+        (state.recording_active || state.recording_start_pending || state.calibrated_record_armed)
+            ? RGB(109, 204, 163)
+            : RGB(172, 187, 205));
     state.thumbnail_canvas.DrawSmall(
         TruncateMiddle(Utf8ToWide(state.status_text.empty() ? "Idle" : state.status_text), 28),
         RECT{26, 206, 374, 238},
