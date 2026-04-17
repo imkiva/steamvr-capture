@@ -39,6 +39,7 @@ namespace SteamVRCapture.UnityExample.Editor
             serializedPlayback.FindProperty("playbackSpeed").floatValue = 1.0f;
             serializedPlayback.FindProperty("createDebugTargets").boolValue = true;
             serializedPlayback.ApplyModifiedPropertiesWithoutUndo();
+            playback.ForceRecreateTrackerGameObjects();
 
             GameObject floor = GameObject.CreatePrimitive(PrimitiveType.Plane);
             floor.name = "Ground";

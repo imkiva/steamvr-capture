@@ -22,8 +22,8 @@ namespace SteamVRCapture.UnityExample
         [SerializeField] private bool createDebugTargets = true;
         [SerializeField] private Transform debugTargetRoot;
         [SerializeField] private List<DeviceBinding> bindings = new();
+        [SerializeField, HideInInspector] private SteamVrCaptureSessionAsset generatedForSession;
 
-        private readonly Dictionary<string, Transform> generatedTargetsBySerial = new();
         private double playbackTimeSeconds;
         private bool isPlaying;
 
@@ -31,24 +31,12 @@ namespace SteamVRCapture.UnityExample
         {
             playbackTimeSeconds = 0.0;
             isPlaying = playOnEnable;
-            RebuildDebugTargets();
             ApplyCurrentFrame();
-        }
-
-        private void OnDisable()
-        {
-            generatedTargetsBySerial.Clear();
         }
 
         private void OnValidate()
         {
-            if (session == null)
-            {
-                return;
-            }
-
-            RebuildDebugTargets();
-            ApplyCurrentFrame();
+            RecreateTrackerGameObjectsIfSessionChanged();
         }
 
         private void Update()
@@ -72,52 +60,44 @@ namespace SteamVRCapture.UnityExample
             ApplyCurrentFrame();
         }
 
-        [ContextMenu("Rebuild Debug Targets")]
-        public void RebuildDebugTargets()
+        [ContextMenu("Update Tracker GameObjects")]
+        public void UpdateTrackerGameObjects()
         {
-            generatedTargetsBySerial.Clear();
             if (!createDebugTargets || session == null)
             {
+                generatedForSession = session;
                 return;
             }
 
-            Transform root = debugTargetRoot != null ? debugTargetRoot : transform;
-            List<Transform> children = new();
-            for (int index = 0; index < root.childCount; index++)
-            {
-                children.Add(root.GetChild(index));
-            }
-
-            foreach (Transform child in children)
-            {
-                if (child.name.StartsWith("SVRCAP_", StringComparison.Ordinal))
-                {
-                    if (Application.isPlaying)
-                    {
-                        Destroy(child.gameObject);
-                    }
-                    else
-                    {
-                        DestroyImmediate(child.gameObject);
-                    }
-                }
-            }
-
+            Transform root = GetTargetRoot();
             foreach (SteamVrCaptureDeviceTrack track in session.Tracks)
             {
-                GameObject marker = GameObject.CreatePrimitive(PrimitiveType.Cube);
-                marker.name = $"SVRCAP_{track.index}_{track.serial}";
-                marker.transform.SetParent(root, false);
-                marker.transform.localScale = GetMarkerScale(track.deviceClass);
-
-                Renderer renderer = marker.GetComponent<Renderer>();
-                if (renderer != null)
+                if (FindExistingTarget(root, track) == null)
                 {
-                    renderer.sharedMaterial = CreateDebugMaterial(track.deviceClass);
+                    CreateTrackerGameObject(root, track);
                 }
-
-                generatedTargetsBySerial[track.serial] = marker.transform;
             }
+
+            generatedForSession = session;
+            ApplyCurrentFrame();
+        }
+
+        [ContextMenu("Force Recreate Tracker GameObjects")]
+        public void ForceRecreateTrackerGameObjects()
+        {
+            Transform root = GetTargetRoot();
+            DestroyTrackerTargetChildren(root);
+
+            if (createDebugTargets && session != null)
+            {
+                foreach (SteamVrCaptureDeviceTrack track in session.Tracks)
+                {
+                    CreateTrackerGameObject(root, track);
+                }
+            }
+
+            generatedForSession = session;
+            ApplyCurrentFrame();
         }
 
         [ContextMenu("Play")]
@@ -147,6 +127,7 @@ namespace SteamVRCapture.UnityExample
                 return;
             }
 
+            Dictionary<SteamVrCaptureDeviceTrack, Transform> targetsByTrack = BuildTargetsByTrack();
             ulong currentTimestampNs = (ulong)Math.Max(0.0, playbackTimeSeconds * 1_000_000_000.0);
             foreach (SteamVrCaptureDeviceTrack track in session.Tracks)
             {
@@ -161,7 +142,7 @@ namespace SteamVRCapture.UnityExample
                     continue;
                 }
 
-                Transform target = ResolveTarget(track);
+                Transform target = ResolveTarget(track, targetsByTrack);
                 if (target == null)
                 {
                     continue;
@@ -171,7 +152,9 @@ namespace SteamVRCapture.UnityExample
             }
         }
 
-        private Transform ResolveTarget(SteamVrCaptureDeviceTrack track)
+        private Transform ResolveTarget(
+            SteamVrCaptureDeviceTrack track,
+            IReadOnlyDictionary<SteamVrCaptureDeviceTrack, Transform> targetsByTrack)
         {
             foreach (DeviceBinding binding in bindings)
             {
@@ -180,7 +163,8 @@ namespace SteamVRCapture.UnityExample
                     continue;
                 }
 
-                if (!string.IsNullOrEmpty(binding.serial) && string.Equals(binding.serial, track.serial, StringComparison.Ordinal))
+                if (!string.IsNullOrEmpty(binding.serial) &&
+                    string.Equals(binding.serial, track.serial, StringComparison.Ordinal))
                 {
                     return binding.target;
                 }
@@ -193,8 +177,150 @@ namespace SteamVRCapture.UnityExample
                 }
             }
 
-            generatedTargetsBySerial.TryGetValue(track.serial, out Transform generatedTarget);
+            targetsByTrack.TryGetValue(track, out Transform generatedTarget);
             return generatedTarget;
+        }
+
+        private Dictionary<SteamVrCaptureDeviceTrack, Transform> BuildTargetsByTrack()
+        {
+            Dictionary<SteamVrCaptureDeviceTrack, Transform> targetsByTrack = new();
+            if (session == null)
+            {
+                return targetsByTrack;
+            }
+
+            Transform root = GetTargetRoot();
+            SteamVrCaptureTrackedDeviceTarget[] targets =
+                root.GetComponentsInChildren<SteamVrCaptureTrackedDeviceTarget>(true);
+
+            foreach (SteamVrCaptureTrackedDeviceTarget target in targets)
+            {
+                foreach (SteamVrCaptureDeviceTrack track in session.Tracks)
+                {
+                    if (targetsByTrack.ContainsKey(track))
+                    {
+                        continue;
+                    }
+
+                    if (target.Matches(track))
+                    {
+                        targetsByTrack.Add(track, target.transform);
+                        break;
+                    }
+                }
+            }
+
+            return targetsByTrack;
+        }
+
+        private void RecreateTrackerGameObjectsIfSessionChanged()
+        {
+            if (Application.isPlaying || session == generatedForSession)
+            {
+                return;
+            }
+
+            RecreateAllChildrenForSessionChange();
+        }
+
+        private Transform GetTargetRoot()
+        {
+            return debugTargetRoot != null ? debugTargetRoot : transform;
+        }
+
+        private static SteamVrCaptureTrackedDeviceTarget FindExistingTarget(Transform root, SteamVrCaptureDeviceTrack track)
+        {
+            SteamVrCaptureTrackedDeviceTarget[] targets =
+                root.GetComponentsInChildren<SteamVrCaptureTrackedDeviceTarget>(true);
+            foreach (SteamVrCaptureTrackedDeviceTarget target in targets)
+            {
+                if (target.Matches(track))
+                {
+                    return target;
+                }
+            }
+
+            return null;
+        }
+
+        private static GameObject CreateTrackerGameObject(Transform root, SteamVrCaptureDeviceTrack track)
+        {
+            GameObject marker = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            string label = string.IsNullOrWhiteSpace(track.serial) ? $"track_{track.index}" : track.serial;
+            marker.name = $"SVRCAP Target {track.index} {label}";
+            marker.transform.SetParent(root, false);
+            marker.transform.localScale = GetMarkerScale(track.deviceClass);
+
+            SteamVrCaptureTrackedDeviceTarget target = marker.AddComponent<SteamVrCaptureTrackedDeviceTarget>();
+            target.ConfigureFromTrack(track);
+
+            Renderer renderer = marker.GetComponent<Renderer>();
+            if (renderer != null)
+            {
+                renderer.sharedMaterial = CreateDebugMaterial(track.deviceClass);
+            }
+
+            return marker;
+        }
+
+        private void RecreateAllChildrenForSessionChange()
+        {
+            Transform root = GetTargetRoot();
+            DestroyAllChildren(root);
+
+            if (createDebugTargets && session != null)
+            {
+                foreach (SteamVrCaptureDeviceTrack track in session.Tracks)
+                {
+                    CreateTrackerGameObject(root, track);
+                }
+            }
+
+            generatedForSession = session;
+            ApplyCurrentFrame();
+        }
+
+        private static void DestroyTrackerTargetChildren(Transform root)
+        {
+            SteamVrCaptureTrackedDeviceTarget[] targets =
+                root.GetComponentsInChildren<SteamVrCaptureTrackedDeviceTarget>(true);
+            foreach (SteamVrCaptureTrackedDeviceTarget target in targets)
+            {
+                if (target.transform == root)
+                {
+                    continue;
+                }
+
+                if (Application.isPlaying)
+                {
+                    Destroy(target.gameObject);
+                }
+                else
+                {
+                    DestroyImmediate(target.gameObject);
+                }
+            }
+        }
+
+        private static void DestroyAllChildren(Transform root)
+        {
+            List<Transform> children = new();
+            for (int index = 0; index < root.childCount; index++)
+            {
+                children.Add(root.GetChild(index));
+            }
+
+            foreach (Transform child in children)
+            {
+                if (Application.isPlaying)
+                {
+                    Destroy(child.gameObject);
+                }
+                else
+                {
+                    DestroyImmediate(child.gameObject);
+                }
+            }
         }
 
         private static SteamVrCapturePoseSample SampleAtOrBefore(IReadOnlyList<SteamVrCapturePoseSample> samples, ulong timestampNs)
