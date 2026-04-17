@@ -86,6 +86,13 @@ jobs:
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "Nightly Build" --notes "$notes" --prerelease
+
+            old_assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name | select(startswith("SteamVRCapture-") and endswith(".exe"))')"
+            while IFS= read -r old_asset; do
+              if [ -n "$old_asset" ]; then
+                gh release delete-asset "$tag" "$old_asset" --repo "$GITHUB_REPOSITORY" --yes
+              fi
+            done <<< "$old_assets"
           else
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "Nightly Build" --notes "$notes" --prerelease --target "$sha"
           fi
