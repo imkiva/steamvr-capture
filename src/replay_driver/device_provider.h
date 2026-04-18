@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "openvr_driver.h"
@@ -33,7 +34,9 @@ private:
 
     void PollControlSettings();
     bool ApplyRequestedSession(const std::string& session_path, std::int32_t generation);
-    void EnsureTrackerCapacity(std::size_t required_count);
+    std::vector<std::size_t> EnsureReplayDevicesForSession(
+        const session::SessionData& loaded_session,
+        const std::vector<std::size_t>& tracker_session_indices);
     void SetPlaybackState(PlaybackState next_state, std::chrono::steady_clock::time_point now, bool update_settings);
     void AdvancePlayback(std::chrono::steady_clock::time_point now);
     void WriteRuntimeStatus(const std::string& status_text, const std::string& last_error);
@@ -42,10 +45,14 @@ private:
     bool ShouldPublishVirtualTrackers() const;
     static PlaybackState ParsePlaybackState(const std::string& value);
     static const char* PlaybackStateToString(PlaybackState value);
-    static bool IsTrackerDescriptor(const session::TrackerDescriptor& descriptor);
+    static bool ShouldReplayDescriptorAsTracker(
+        session::SessionFileVersion format_version,
+        const session::TrackerDescriptor& descriptor);
 
     session::SessionData session_;
     std::vector<std::unique_ptr<ReplayTrackerDevice>> tracker_devices_;
+    std::unordered_map<std::string, std::size_t> tracker_device_by_serial_;
+    std::vector<std::size_t> active_tracker_device_indices_;
     std::vector<std::size_t> tracker_device_session_indices_;
     std::chrono::steady_clock::time_point playback_started_at_{};
     std::chrono::steady_clock::time_point last_control_poll_at_{};

@@ -14,7 +14,10 @@ namespace steamvr_capture::replay
 class ReplayTrackerDevice : public vr::ITrackedDeviceServerDriver
 {
 public:
-    explicit ReplayTrackerDevice(std::size_t slot_index);
+    ReplayTrackerDevice(
+        std::size_t slot_index,
+        const session::TrackerDescriptor& descriptor,
+        std::string serial_number);
 
     vr::EVRInitError Activate(std::uint32_t object_id) override;
     void EnterStandby() override;
@@ -24,6 +27,7 @@ public:
     void Deactivate() override;
 
     const std::string& serial_number() const;
+    static std::string BuildSerialNumber(const session::TrackerDescriptor& descriptor, std::size_t fallback_slot_index);
     void UpdateDescriptor(const std::optional<session::TrackerDescriptor>& descriptor);
     void UpdateSample(const session::PoseSample& sample);
     void SetDisconnected();

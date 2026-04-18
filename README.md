@@ -15,6 +15,7 @@ Bootstrap workspace for recording SteamVR tracked-device motion and replaying it
   - SteamVR OpenVR driver.
   - Polls replay control state from SteamVR settings.
   - Exposes virtual `GenericTracker` devices and feeds replay poses into SteamVR.
+  - For v3 calibrated sessions, HMD and controller source devices are also replayed as virtual `GenericTracker` devices.
 
 - `steamvr_capture_session`
   - Shared file format and parser/writer library.
@@ -82,6 +83,7 @@ The current implementation uses a text bootstrap format so the recorder, broker,
 - v3 header: `SVRCAP<TAB>3`
 - v3 semantic: app-standing calibrated capture for Unity playback after Space Calibrator alignment.
 - v3 is written by `steamvr_capture_recorder --record-mode app_standing_calibrated`, not by the broker.
+- v3 SteamVR replay maps every recorded HMD, controller, and tracker source device to a virtual `GenericTracker`; it does not create virtual HMDs or virtual controllers.
 
 This is a temporary bootstrap. The architecture document in `AGENTS.md` already reserves a later migration to a binary format.
 
@@ -267,6 +269,8 @@ Current limitation:
 - In `Replace`, this can overwrite the active HMD/controller pose feed with recorded data.
 - In practice this can cause severe headset stutter or an unusable view.
 - Until per-class replay targeting is added, treat live `Suppress` / `Replace` as tracker-focused only and avoid using HMD/controller-inclusive sessions for those modes.
+
+v3 calibrated sessions are different from v2 driver-pose sessions for virtual replay: the replay driver publishes v3 HMD/controller/tracker source poses as independent virtual trackers for visualization or downstream capture. This does not include controller input, buttons, skeleton, or HMD replacement.
 
 ## Known Gaps
 

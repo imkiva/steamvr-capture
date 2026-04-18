@@ -2,6 +2,9 @@
 
 #include "replay_driver/driver_log.h"
 
+#include <cctype>
+#include <utility>
+
 namespace steamvr_capture::replay
 {
 namespace
@@ -10,12 +13,81 @@ constexpr const char* kDriverName = "steamvr_capture_replay";
 constexpr const char* kInputProfilePath = "{steamvr_capture_replay}/input/svrcap_tracker_profile.json";
 constexpr const char* kControllerType = "svrcap_replay_tracker";
 constexpr const char* kManufacturerName = "steamvr-capture";
+constexpr const char* kLighthouseTrackingSystem = "lighthouse";
+
+constexpr std::int32_t kHmdClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_HMD);
+constexpr std::int32_t kControllerClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_Controller);
+constexpr std::int32_t kGenericTrackerClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_GenericTracker);
+
+bool IsSourceTracker(const session::TrackerDescriptor& descriptor)
+{
+    return descriptor.device_class == 0 || descriptor.device_class == kGenericTrackerClass;
+}
+
+bool IsSourceHmdOrController(const session::TrackerDescriptor& descriptor)
+{
+    return descriptor.device_class == kHmdClass || descriptor.device_class == kControllerClass;
+}
+
+std::string SourceClassLabel(const session::TrackerDescriptor& descriptor)
+{
+    switch (descriptor.device_class)
+    {
+    case kHmdClass:
+        return "HMD";
+    case kControllerClass:
+        return "Controller";
+    case kGenericTrackerClass:
+        return "Tracker";
+    default:
+        return "Device";
+    }
+}
+
+std::string BuildReplayModelNumber(const std::optional<session::TrackerDescriptor>& descriptor)
+{
+    if (!descriptor.has_value())
+    {
+        return "Kiva Tracker";
+    }
+
+    if (!descriptor->model_number.empty())
+    {
+        return descriptor->model_number;
+    }
+
+    return "Kiva " + SourceClassLabel(*descriptor);
+}
+
+std::string BuildReplayTrackingSystem(const std::optional<session::TrackerDescriptor>& descriptor)
+{
+    if (!descriptor.has_value())
+    {
+        return kDriverName;
+    }
+
+    if (IsSourceHmdOrController(*descriptor))
+    {
+        return kLighthouseTrackingSystem;
+    }
+
+    if (!descriptor->tracking_system.empty())
+    {
+        return descriptor->tracking_system;
+    }
+
+    return kDriverName;
+}
 }  // namespace
 
-ReplayTrackerDevice::ReplayTrackerDevice(const std::size_t slot_index)
+ReplayTrackerDevice::ReplayTrackerDevice(
+    const std::size_t slot_index,
+    const session::TrackerDescriptor& descriptor,
+    std::string serial_number)
     : slot_index_(slot_index)
+    , descriptor_(descriptor)
+    , serial_number_(std::move(serial_number))
 {
-    serial_number_ = "svrcap_replay_slot_" + std::to_string(slot_index_ + 1);
 }
 
 vr::EVRInitError ReplayTrackerDevice::Activate(const std::uint32_t object_id)
@@ -70,6 +142,33 @@ const std::string& ReplayTrackerDevice::serial_number() const
     return serial_number_;
 }
 
+std::string ReplayTrackerDevice::BuildSerialNumber(
+    const session::TrackerDescriptor& descriptor,
+    const std::size_t fallback_slot_index)
+{
+    std::string source_serial = descriptor.serial;
+    if (source_serial.empty())
+    {
+        source_serial = "device_" + std::to_string(fallback_slot_index + 1);
+    }
+
+    std::string sanitized;
+    sanitized.reserve(source_serial.size());
+    for (const unsigned char ch : source_serial)
+    {
+        if (std::isalnum(ch) != 0 || ch == '-' || ch == '_')
+        {
+            sanitized.push_back(static_cast<char>(ch));
+        }
+        else
+        {
+            sanitized.push_back('_');
+        }
+    }
+
+    return "ktk_" + sanitized;
+}
+
 void ReplayTrackerDevice::UpdateDescriptor(const std::optional<session::TrackerDescriptor>& descriptor)
 {
     std::lock_guard<std::mutex> lock(pose_mutex_);
@@ -116,17 +215,16 @@ void ReplayTrackerDevice::ApplyPropertiesLocked()
         return;
     }
 
-    const std::string model_number = descriptor_.has_value() && !descriptor_->model_number.empty()
-        ? descriptor_->model_number
-        : "SteamVR Capture Replay Tracker";
+    const bool source_is_tracker = descriptor_.has_value() && IsSourceTracker(*descriptor_);
+    const std::string model_number = BuildReplayModelNumber(descriptor_);
 
-    const std::string tracking_system = descriptor_.has_value() && !descriptor_->tracking_system.empty()
-        ? descriptor_->tracking_system
-        : "steamvr-capture";
-    const std::string manufacturer = descriptor_.has_value() && !descriptor_->manufacturer_name.empty()
+    const std::string tracking_system = BuildReplayTrackingSystem(descriptor_);
+    const std::string manufacturer =
+        source_is_tracker && descriptor_.has_value() && !descriptor_->manufacturer_name.empty()
         ? descriptor_->manufacturer_name
         : kManufacturerName;
-    const std::string controller_type = descriptor_.has_value() && !descriptor_->controller_type.empty()
+    const std::string controller_type =
+        descriptor_.has_value() && !descriptor_->controller_type.empty()
         ? descriptor_->controller_type
         : kControllerType;
 
@@ -145,7 +243,7 @@ void ReplayTrackerDevice::ApplyTrackerRoleSettingLocked()
 {
     vr::EVRSettingsError error = vr::VRSettingsError_None;
     const std::string key = "/devices/" + std::string(kDriverName) + "/" + serial_number_;
-    if (!descriptor_.has_value() || descriptor_->role.empty())
+    if (!descriptor_.has_value() || !IsSourceTracker(*descriptor_) || descriptor_->role.empty())
     {
         vr::VRSettings()->RemoveKeyInSection(vr::k_pch_Trackers_Section, key.c_str(), &error);
         return;

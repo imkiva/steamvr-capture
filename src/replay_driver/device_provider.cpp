@@ -10,6 +10,8 @@ namespace steamvr_capture::replay
 {
 namespace
 {
+constexpr std::int32_t kHmdClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_HMD);
+constexpr std::int32_t kControllerClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_Controller);
 constexpr std::int32_t kGenericTrackerClass = static_cast<std::int32_t>(vr::TrackedDeviceClass_GenericTracker);
 
 std::string ReadSettingsString(const char* section, const char* key)
@@ -88,30 +90,25 @@ void DeviceProvider::RunFrame()
 
     if (!tracker_device_session_indices_.empty())
     {
-        for (std::size_t tracker_index = 0; tracker_index < tracker_devices_.size(); ++tracker_index)
+        for (std::size_t tracker_index = 0; tracker_index < active_tracker_device_indices_.size(); ++tracker_index)
         {
-            if (tracker_index >= tracker_device_session_indices_.size())
-            {
-                tracker_devices_[tracker_index]->SetDisconnected();
-                continue;
-            }
-
             const std::size_t session_index = tracker_device_session_indices_[tracker_index];
+            ReplayTrackerDevice* tracker_device = tracker_devices_[active_tracker_device_indices_[tracker_index]].get();
 
             if (!ShouldPublishVirtualTrackers())
             {
-                tracker_devices_[tracker_index]->SetDisconnected();
+                tracker_device->SetDisconnected();
                 continue;
             }
 
             const auto sample = session::SampleAtOrBefore(session_, session_index, playback_timestamp_ns_);
             if (sample.has_value())
             {
-                tracker_devices_[tracker_index]->UpdateSample(*sample);
+                tracker_device->UpdateSample(*sample);
             }
             else
             {
-                tracker_devices_[tracker_index]->SetDisconnected();
+                tracker_device->SetDisconnected();
             }
         }
     }
@@ -140,6 +137,8 @@ void DeviceProvider::Cleanup()
 {
     session_ = {};
     tracker_devices_.clear();
+    tracker_device_by_serial_.clear();
+    active_tracker_device_indices_.clear();
     tracker_device_session_indices_.clear();
     playback_base_timestamp_ns_ = 0;
     playback_timestamp_ns_ = 0;
@@ -219,6 +218,8 @@ bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, cons
             tracker_device->UpdateDescriptor(std::nullopt);
             tracker_device->SetDisconnected();
         }
+        active_tracker_device_indices_.clear();
+        tracker_device_session_indices_.clear();
         WriteRuntimeStatus("Idle", "");
         WriteLoadedSessionMetadata();
         WritePlaybackStateSetting();
@@ -250,13 +251,13 @@ bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, cons
     tracker_session_indices.reserve(loaded_session.trackers.size());
     for (std::size_t index = 0; index < loaded_session.trackers.size(); ++index)
     {
-        if (IsTrackerDescriptor(loaded_session.trackers[index]))
+        if (ShouldReplayDescriptorAsTracker(loaded_session.format_version, loaded_session.trackers[index]))
         {
             tracker_session_indices.push_back(index);
         }
     }
 
-    EnsureTrackerCapacity(tracker_session_indices.size());
+    tracker_session_indices = EnsureReplayDevicesForSession(loaded_session, tracker_session_indices);
 
     session_ = std::move(loaded_session);
     tracker_device_session_indices_ = std::move(tracker_session_indices);
@@ -266,15 +267,15 @@ bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, cons
 
     for (std::size_t index = 0; index < tracker_devices_.size(); ++index)
     {
-        if (index < tracker_device_session_indices_.size())
-        {
-            tracker_devices_[index]->UpdateDescriptor(session_.trackers[tracker_device_session_indices_[index]]);
-        }
-        else
-        {
-            tracker_devices_[index]->UpdateDescriptor(std::nullopt);
-        }
+        tracker_devices_[index]->UpdateDescriptor(std::nullopt);
         tracker_devices_[index]->SetDisconnected();
+    }
+
+    for (std::size_t active_index = 0; active_index < active_tracker_device_indices_.size(); ++active_index)
+    {
+        const std::size_t device_index = active_tracker_device_indices_[active_index];
+        const std::size_t session_index = tracker_device_session_indices_[active_index];
+        tracker_devices_[device_index]->UpdateDescriptor(session_.trackers[session_index]);
     }
 
     WriteRuntimeStatus("Loaded session", "");
@@ -288,21 +289,46 @@ bool DeviceProvider::ApplyRequestedSession(const std::string& session_path, cons
     return true;
 }
 
-void DeviceProvider::EnsureTrackerCapacity(const std::size_t required_count)
+std::vector<std::size_t> DeviceProvider::EnsureReplayDevicesForSession(
+    const session::SessionData& loaded_session,
+    const std::vector<std::size_t>& tracker_session_indices)
 {
-    while (tracker_devices_.size() < required_count)
+    std::vector<std::size_t> active_session_indices;
+    active_session_indices.reserve(tracker_session_indices.size());
+
+    active_tracker_device_indices_.clear();
+    active_tracker_device_indices_.reserve(tracker_session_indices.size());
+
+    for (std::size_t active_index = 0; active_index < tracker_session_indices.size(); ++active_index)
     {
-        auto tracker_device = std::make_unique<ReplayTrackerDevice>(tracker_devices_.size());
+        const std::size_t session_index = tracker_session_indices[active_index];
+        const session::TrackerDescriptor& descriptor = loaded_session.trackers[session_index];
+        std::string serial_number = ReplayTrackerDevice::BuildSerialNumber(descriptor, active_index);
+        const auto existing = tracker_device_by_serial_.find(serial_number);
+        if (existing != tracker_device_by_serial_.end())
+        {
+            active_tracker_device_indices_.push_back(existing->second);
+            active_session_indices.push_back(session_index);
+            continue;
+        }
+
+        const std::size_t device_slot = tracker_devices_.size();
+        auto tracker_device = std::make_unique<ReplayTrackerDevice>(device_slot, descriptor, serial_number);
         if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
                 tracker_device->serial_number().c_str(),
                 vr::TrackedDeviceClass_GenericTracker,
                 tracker_device.get()))
         {
             DriverLog("Failed to register replay tracker %s", tracker_device->serial_number().c_str());
-            return;
+            continue;
         }
+        tracker_device_by_serial_[tracker_device->serial_number()] = device_slot;
+        active_tracker_device_indices_.push_back(device_slot);
+        active_session_indices.push_back(session_index);
         tracker_devices_.push_back(std::move(tracker_device));
     }
+
+    return active_session_indices;
 }
 
 void DeviceProvider::SetPlaybackState(
@@ -418,7 +444,7 @@ void DeviceProvider::WriteLoadedSessionMetadata()
     vr::VRSettings()->SetInt32(
         replay_settings::kDriverSection,
         replay_settings::kLoadedTrackerCountKey,
-        static_cast<std::int32_t>(session_.trackers.size()),
+        static_cast<std::int32_t>(tracker_device_session_indices_.size()),
         &error);
 }
 
@@ -437,9 +463,21 @@ bool DeviceProvider::ShouldPublishVirtualTrackers() const
     return live_mode_ != "replace" || !session_.poses_are_driver_space;
 }
 
-bool DeviceProvider::IsTrackerDescriptor(const session::TrackerDescriptor& descriptor)
+bool DeviceProvider::ShouldReplayDescriptorAsTracker(
+    const session::SessionFileVersion format_version,
+    const session::TrackerDescriptor& descriptor)
 {
-    return descriptor.device_class == 0 || descriptor.device_class == kGenericTrackerClass;
+    if (descriptor.device_class == 0 || descriptor.device_class == kGenericTrackerClass)
+    {
+        return true;
+    }
+
+    if (format_version != session::SessionFileVersion::CalibratedStandingPoseV3)
+    {
+        return false;
+    }
+
+    return descriptor.device_class == kHmdClass || descriptor.device_class == kControllerClass;
 }
 
 DeviceProvider::PlaybackState DeviceProvider::ParsePlaybackState(const std::string& value)

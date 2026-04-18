@@ -30,6 +30,8 @@ The project is intentionally split into two OpenVR layers:
    - Creates virtual `TrackedDeviceClass_GenericTracker` devices.
    - Reads a previously recorded session file.
    - Pushes replay poses back into SteamVR through `TrackedDevicePoseUpdated`.
+   - v3 calibrated sessions replay HMD, controller, and tracker source devices as virtual `GenericTracker` devices.
+   - v2 driver-pose sessions remain tracker-only for normal virtual replay; HMD/controller handling in v2 belongs to the experimental hotpatch path.
 
 3. `session-format`
    - Shared library with no OpenVR header dependency.
@@ -90,6 +92,7 @@ The project is intentionally split into two OpenVR layers:
 - Overlay must remain a separate OpenVR application binary and must not link against `openvr_driver.h`.
 - Session files must include serial number, tracking system name, model number, device class, and role metadata.
 - Replay driver must expose unique virtual serial numbers and must not impersonate real HTC tracker serial numbers.
+- Replaying HMD/controller source data must still create `GenericTracker` devices, not virtual HMDs or virtual controllers.
 - Recorder must skip the project's own virtual replay trackers so a new capture session never re-records replay output.
 - Replay mode still prefers real trackers to be powered off unless the hotpatch path is intentionally being used for `suppress` or `replace`.
 - The no-restart hotpatch path is experimental and unsupported by Valve. Keep heavy logic out of the injected DLL; session parsing and transport control belong in the broker.
