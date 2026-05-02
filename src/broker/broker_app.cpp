@@ -5,11 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "capture/openvr_app_helpers.h"
@@ -76,6 +78,12 @@ void WriteSettingsString(const char* section, const char* key, const std::string
     vr::VRSettings()->SetString(section, key, value.c_str(), &error);
 }
 
+void WriteSettingsBool(const char* section, const char* key, const bool value)
+{
+    vr::EVRSettingsError error = vr::VRSettingsError_None;
+    vr::VRSettings()->SetBool(section, key, value, &error);
+}
+
 bool ReadSettingsBool(const char* section, const char* key, const bool fallback)
 {
     vr::EVRSettingsError error = vr::VRSettingsError_None;
@@ -103,6 +111,51 @@ std::string NormalizePlaybackState(const std::string& playback_state)
 std::string NormalizeRecordState(const std::string& record_state)
 {
     return record_state == "recording" ? "recording" : "stopped";
+}
+
+std::string TrimAscii(std::string_view text)
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0)
+    {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())) != 0)
+    {
+        text.remove_suffix(1);
+    }
+    return std::string(text);
+}
+
+std::vector<std::wstring> ParseDisabledSerials(const std::string& setting)
+{
+    std::vector<std::wstring> serials;
+    std::size_t start = 0;
+    while (start <= setting.size())
+    {
+        const std::size_t end = setting.find_first_of(";\r\n,", start);
+        const std::string serial = TrimAscii(std::string_view(
+            setting.data() + start,
+            (end == std::string::npos ? setting.size() : end) - start));
+        if (!serial.empty())
+        {
+            const std::wstring wide_serial = Utf8ToWide(serial);
+            if (!wide_serial.empty() &&
+                std::find_if(serials.begin(), serials.end(), [&](const std::wstring& existing)
+                {
+                    return _wcsicmp(existing.c_str(), wide_serial.c_str()) == 0;
+                }) == serials.end())
+            {
+                serials.push_back(wide_serial);
+            }
+        }
+
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1u;
+    }
+    return serials;
 }
 
 hotpatch::LiveMode ParseLiveModeSetting(const std::string& live_mode, const bool suppress_real_trackers)
@@ -254,7 +307,8 @@ int BrokerApp::Run(const bool once)
                 playback_active_ &&
                 live_mode_ != hotpatch::LiveMode::Passthrough &&
                 !(live_mode_ == hotpatch::LiveMode::Replace && !loaded_session_.poses_are_driver_space);
-            const bool should_inject = recording_active_ || playback_requires_injection;
+            const bool should_inject =
+                recording_active_ || playback_requires_injection || !disabled_device_serials_.empty();
             if (should_inject)
             {
                 std::string inject_error;
@@ -307,6 +361,7 @@ int BrokerApp::PrintStatus()
     std::printf("pose_updates_seen=%u\n", shared_state_->pose_updates_seen);
     std::printf("pose_updates_suppressed=%u\n", shared_state_->pose_updates_suppressed);
     std::printf("pose_updates_replaced=%u\n", shared_state_->pose_updates_replaced);
+    std::printf("pose_updates_disabled=%u\n", shared_state_->pose_updates_disabled);
     std::printf("recording_devices=%u\n", shared_state_->recording_device_count);
     std::printf("recorded_sample_count=%llu\n", static_cast<unsigned long long>(shared_state_->recorded_sample_count));
     std::printf("playback_timestamp_ns=%llu\n", static_cast<unsigned long long>(shared_state_->playback_timestamp_ns));
@@ -319,6 +374,13 @@ int BrokerApp::PrintStatus()
     for (std::uint32_t index = 0; index < shared_state_->serial_count && index < hotpatch::kMaxTrackedSerials; ++index)
     {
         std::printf("serial[%u]=%s\n", index, WideToUtf8(shared_state_->serials[index].serial).c_str());
+    }
+    std::printf("disabled_serial_count=%u\n", shared_state_->disabled_serial_count);
+    for (std::uint32_t index = 0;
+         index < shared_state_->disabled_serial_count && index < hotpatch::kMaxDisabledDeviceSerials;
+         ++index)
+    {
+        std::printf("disabled_serial[%u]=%s\n", index, WideToUtf8(shared_state_->disabled_serials[index].serial).c_str());
     }
     return 0;
 }
@@ -510,6 +572,14 @@ void BrokerApp::PollReplayState()
         replay_settings::kDriverSection,
         replay_settings::kPlaybackSpeedKey,
         1.0);
+    const std::vector<std::wstring> disabled_device_serials = ParseDisabledSerials(ReadSettingsString(
+        replay_settings::kHotpatchSection,
+        replay_settings::kDisabledDeviceSerialsKey));
+    if (!disabled_device_serials.empty() &&
+        !ReadSettingsBool(replay_settings::kDriverSection, replay_settings::kEnableKey, true))
+    {
+        WriteSettingsBool(replay_settings::kDriverSection, replay_settings::kEnableKey, true);
+    }
 
     const hotpatch::LiveMode live_mode = ParseLiveModeSetting(live_mode_setting, suppress_real_trackers);
     const std::string normalized_playback_state = NormalizePlaybackState(playback_state);
@@ -518,11 +588,15 @@ void BrokerApp::PollReplayState()
     const bool speed_changed = std::abs(playback_speed_ - playback_speed) > 0.0001;
     const bool loop_changed = loop_enabled_ != loop_enabled;
     const bool live_mode_changed = live_mode_ != live_mode || suppress_real_trackers_ != suppress_real_trackers;
-    const bool state_changed = session_changed || playback_state_changed || speed_changed || loop_changed || live_mode_changed;
+    const bool disabled_serials_changed = disabled_device_serials_ != disabled_device_serials;
+    const bool state_changed =
+        session_changed || playback_state_changed || speed_changed || loop_changed || live_mode_changed ||
+        disabled_serials_changed;
 
     session_path_ = next_session_path;
     suppress_real_trackers_ = suppress_real_trackers;
     live_mode_ = live_mode;
+    disabled_device_serials_ = disabled_device_serials;
 
     if (session_changed)
     {
@@ -1017,6 +1091,8 @@ void BrokerApp::UpdateSharedState()
     shared_state_->suppress_real_trackers = live_mode_ == hotpatch::LiveMode::Passthrough ? 0u : 1u;
     shared_state_->live_mode = static_cast<std::uint32_t>(live_mode_);
     shared_state_->serial_count = static_cast<std::uint32_t>(target_serials_.size());
+    shared_state_->disabled_serial_count =
+        static_cast<std::uint32_t>(std::min<std::size_t>(disabled_device_serials_.size(), hotpatch::kMaxDisabledDeviceSerials));
     shared_state_->playback_timestamp_ns = playback_timestamp_ns_;
     shared_state_->recording_active = recording_active_ ? 1u : 0u;
     shared_state_->recording_device_count = static_cast<std::uint32_t>(recording_devices_.size());
@@ -1039,6 +1115,20 @@ void BrokerApp::UpdateSharedState()
         }
     }
 
+    for (std::size_t index = 0; index < hotpatch::kMaxDisabledDeviceSerials; ++index)
+    {
+        if (index < disabled_device_serials_.size())
+        {
+            shared_state_->disabled_serials[index].device_class = 0u;
+            CopyWideText(shared_state_->disabled_serials[index].serial, disabled_device_serials_[index]);
+        }
+        else
+        {
+            shared_state_->disabled_serials[index].device_class = 0u;
+            shared_state_->disabled_serials[index].serial[0] = L'\0';
+        }
+    }
+
     if (recording_active_)
     {
         recording_status_text_ =
@@ -1056,6 +1146,13 @@ void BrokerApp::UpdateSharedState()
     if (target_pid_ == 0u)
     {
         CopyWideText(shared_state_->broker_status_text, L"Waiting for vrserver.exe.");
+    }
+    else if (!disabled_device_serials_.empty() && !playback_active_)
+    {
+        CopyWideText(
+            shared_state_->broker_status_text,
+            Utf8ToWide(
+                "Broker active. Disabling " + std::to_string(disabled_device_serials_.size()) + " selected device(s)."));
     }
     else if (!playback_active_)
     {

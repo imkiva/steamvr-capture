@@ -66,9 +66,11 @@ void HotpatchRuntime::Run()
                 L"Injected into vrserver. Waiting for driver_lighthouse.dll to appear before installing hooks.",
                 HookState::Injected);
         }
-        else if ((shared_state_->playback_active == 0u && shared_state_->recording_active == 0u) ||
+        else if ((shared_state_->playback_active == 0u && shared_state_->recording_active == 0u &&
+                     shared_state_->disabled_serial_count == 0u) ||
             (shared_state_->recording_active == 0u &&
-                static_cast<LiveMode>(shared_state_->live_mode) == LiveMode::Passthrough))
+                static_cast<LiveMode>(shared_state_->live_mode) == LiveMode::Passthrough &&
+                shared_state_->disabled_serial_count == 0u))
         {
             if (server_driver_hook_ != nullptr && server_driver_hook_->installed())
             {

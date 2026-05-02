@@ -20,6 +20,7 @@ constexpr char kStatusTextKey[] = "status_text";
 constexpr char kLastErrorKey[] = "last_error";
 constexpr char kSuppressRealTrackersKey[] = "suppress_real_trackers";
 constexpr char kLiveModeKey[] = "live_mode";
+constexpr char kDisabledDeviceSerialsKey[] = "disabled_device_serials";
 
 constexpr char kSessionRootKey[] = "session_root";
 constexpr char kRecordIntervalMsKey[] = "record_interval_ms";

@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <iomanip>
@@ -40,7 +41,7 @@ constexpr int kThumbnailWidth = 400;
 constexpr int kThumbnailHeight = 400;
 constexpr int kDesktopWindowWidth = 1280;
 constexpr int kDesktopWindowHeight = 860;
-constexpr int kPageSize = 8;
+constexpr int kPageSize = 5;
 constexpr float kOverlayWidthMeters = 1.6f;
 constexpr float kThumbnailWidthMeters = 0.32f;
 constexpr std::chrono::milliseconds kUiTickInterval(16);
@@ -50,6 +51,7 @@ constexpr std::chrono::milliseconds kIgnoreVrClickAfterArmedStart(700);
 constexpr wchar_t kUiFontFace[] = L"Segoe UI";
 constexpr wchar_t kDesktopWindowClassName[] = L"SteamVRCaptureReplayDesktopWindow";
 constexpr std::array<float, 5> kRecordIntervalPresetsMs = {5.0f, 8.33f, 10.0f, 11.11f, 16.67f};
+constexpr int kDeviceListVisibleRows = 5;
 
 enum class ButtonAction
 {
@@ -71,6 +73,10 @@ enum class ButtonAction
     PasteClipboard,
     ReloadCurrent,
     LoadFile,
+    DeviceScrollUp,
+    DeviceScrollDown,
+    ToggleDeviceDisabled,
+    ClearDisabledDevices,
 };
 
 enum class KeyboardMode : std::uint64_t
@@ -86,6 +92,18 @@ struct Button
     RECT rect{};
     ButtonAction action = ButtonAction::None;
     std::size_t file_index = 0;
+};
+
+struct DeviceControlItem
+{
+    std::uint32_t device_index = 0;
+    std::int32_t device_class = 0;
+    std::string serial;
+    std::string model_number;
+    std::string manufacturer_name;
+    std::string controller_type;
+    std::string tracking_system;
+    bool disabled = false;
 };
 
 std::wstring Utf8ToWide(const std::string_view text)
@@ -337,6 +355,113 @@ bool ReadSettingsBool(const char* section, const char* key, const bool fallback)
     vr::EVRSettingsError error = vr::VRSettingsError_None;
     const bool value = vr::VRSettings()->GetBool(section, key, &error);
     return error == vr::VRSettingsError_None ? value : fallback;
+}
+
+std::string GetTrackedDeviceString(
+    vr::IVRSystem* vr_system,
+    const vr::TrackedDeviceIndex_t device_index,
+    const vr::ETrackedDeviceProperty property)
+{
+    if (vr_system == nullptr)
+    {
+        return {};
+    }
+
+    char buffer[256] = {};
+    vr::ETrackedPropertyError error = vr::TrackedProp_Success;
+    vr_system->GetStringTrackedDeviceProperty(device_index, property, buffer, sizeof(buffer), &error);
+    return error == vr::TrackedProp_Success ? std::string(buffer) : std::string();
+}
+
+bool IsUiSuppressibleDeviceClass(const vr::ETrackedDeviceClass device_class)
+{
+    return device_class == vr::TrackedDeviceClass_GenericTracker ||
+        device_class == vr::TrackedDeviceClass_Controller;
+}
+
+bool IsProjectVirtualDeviceSerial(const std::string& serial)
+{
+    return serial.rfind("svrcap_replay_slot_", 0) == 0 || serial.rfind("ktk_", 0) == 0;
+}
+
+std::wstring DeviceClassLabel(const std::int32_t device_class)
+{
+    switch (static_cast<vr::ETrackedDeviceClass>(device_class))
+    {
+    case vr::TrackedDeviceClass_Controller:
+        return L"Controller";
+    case vr::TrackedDeviceClass_GenericTracker:
+        return L"Tracker";
+    default:
+        return L"Device";
+    }
+}
+
+std::string TrimAscii(std::string_view text)
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0)
+    {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())) != 0)
+    {
+        text.remove_suffix(1);
+    }
+    return std::string(text);
+}
+
+std::vector<std::string> ParseSerialListSetting(const std::string& setting)
+{
+    std::vector<std::string> serials;
+    std::size_t start = 0;
+    while (start <= setting.size())
+    {
+        const std::size_t end = setting.find_first_of(";\r\n,", start);
+        const std::string serial = TrimAscii(std::string_view(
+            setting.data() + start,
+            (end == std::string::npos ? setting.size() : end) - start));
+        if (!serial.empty() &&
+            std::find_if(serials.begin(), serials.end(), [&](const std::string& existing)
+            {
+                return _stricmp(existing.c_str(), serial.c_str()) == 0;
+            }) == serials.end())
+        {
+            serials.push_back(serial);
+        }
+
+        if (end == std::string::npos)
+        {
+            break;
+        }
+        start = end + 1u;
+    }
+    return serials;
+}
+
+std::string JoinSerialListSetting(const std::vector<std::string>& serials)
+{
+    std::string result;
+    for (const std::string& serial : serials)
+    {
+        if (serial.empty())
+        {
+            continue;
+        }
+        if (!result.empty())
+        {
+            result.push_back(';');
+        }
+        result += serial;
+    }
+    return result;
+}
+
+bool ContainsSerial(const std::vector<std::string>& serials, const std::string& serial)
+{
+    return std::find_if(serials.begin(), serials.end(), [&](const std::string& existing)
+    {
+        return _stricmp(existing.c_str(), serial.c_str()) == 0;
+    }) != serials.end();
 }
 
 float NormalizeRecordIntervalMs(const float value)
@@ -771,6 +896,7 @@ struct OverlayState
     std::uint32_t hotpatch_pose_updates_seen = 0;
     std::uint32_t hotpatch_pose_updates_suppressed = 0;
     std::uint32_t hotpatch_pose_updates_replaced = 0;
+    std::uint32_t hotpatch_pose_updates_disabled = 0;
     bool loop_enabled = true;
     std::string live_mode = "suppress";
     std::string record_mode = "driver_pose";
@@ -785,6 +911,9 @@ struct OverlayState
     std::chrono::steady_clock::time_point ignore_vr_clicks_until{};
     std::chrono::steady_clock::time_point last_settings_refresh{};
     KeyboardMode keyboard_mode = KeyboardMode::None;
+    std::vector<DeviceControlItem> tracked_devices;
+    std::vector<std::string> disabled_device_serials;
+    std::size_t device_list_scroll_index = 0;
     std::vector<Button> buttons;
     GdiCanvas main_canvas{kMainWidth, kMainHeight};
     GdiCanvas thumbnail_canvas{kThumbnailWidth, kThumbnailHeight};
@@ -807,6 +936,8 @@ struct HotpatchSnapshot
     std::uint32_t pose_updates_seen = 0;
     std::uint32_t pose_updates_suppressed = 0;
     std::uint32_t pose_updates_replaced = 0;
+    std::uint32_t pose_updates_disabled = 0;
+    std::uint32_t disabled_serial_count = 0;
 };
 
 const char* HookStateLabel(const hotpatch::HookState state)
@@ -933,6 +1064,8 @@ bool CopyHotpatchSnapshot(const hotpatch::SharedState* shared_state, HotpatchSna
     snapshot->pose_updates_seen = shared_copy.pose_updates_seen;
     snapshot->pose_updates_suppressed = shared_copy.pose_updates_suppressed;
     snapshot->pose_updates_replaced = shared_copy.pose_updates_replaced;
+    snapshot->pose_updates_disabled = shared_copy.pose_updates_disabled;
+    snapshot->disabled_serial_count = shared_copy.disabled_serial_count;
     return true;
 }
 }  // namespace
@@ -972,6 +1105,7 @@ struct OverlayApp::Impl
     void PumpWindowMessages();
     void RefreshSettings(bool force_rescan);
     void RescanSessionFiles();
+    bool RefreshTrackedDeviceList();
     bool EnsureHotpatchStateMapped();
     void CloseHotpatchStateMapping();
     HotpatchSnapshot ReadHotpatchSnapshot() const;
@@ -992,7 +1126,9 @@ struct OverlayApp::Impl
     void PumpOverlayEvents(vr::VROverlayHandle_t overlay_handle);
     void HandleMouseButtonUp(LONG x, LONG y);
     void HandleDesktopWindowClick(LONG x, LONG y);
+    void ScrollDeviceList(int delta_rows);
     void HandleButtonAction(const Button& button, bool from_desktop);
+    void WriteDisabledDeviceSerials();
     void OpenKeyboard(KeyboardMode mode, const std::string& existing_text, const char* description);
     void HandleKeyboardDone(const vr::VREvent_t& event);
     bool PasteClipboardSelection();
@@ -1778,6 +1914,9 @@ bool OverlayApp::Impl::Init(std::string* error)
     vr::VROverlay()->SetOverlayFlag(state.main_overlay, vr::VROverlayFlags_EnableControlBarKeyboard, true);
     vr::VROverlay()->SetOverlayFlag(state.main_overlay, vr::VROverlayFlags_EnableControlBarClose, true);
     vr::VROverlay()->SetOverlayFlag(state.main_overlay, vr::VROverlayFlags_MinimalControlBar, true);
+    vr::VROverlay()->SetOverlayFlag(state.main_overlay, vr::VROverlayFlags_SendVRDiscreteScrollEvents, true);
+    vr::VROverlay()->SetOverlayFlag(state.main_overlay, vr::VROverlayFlags_SendVRSmoothScrollEvents, true);
+    vr::VROverlay()->SetOverlayFlag(state.main_overlay, vr::VROverlayFlags_ShowTouchPadScrollWheel, true);
 
     if (!CreateDesktopWindow(error))
     {
@@ -1968,6 +2107,15 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
         dirty = true;
     }
 
+    const std::vector<std::string> disabled_device_serials = ParseSerialListSetting(ReadSettingsString(
+        replay_settings::kHotpatchSection,
+        replay_settings::kDisabledDeviceSerialsKey));
+    if (disabled_device_serials != state.disabled_device_serials)
+    {
+        state.disabled_device_serials = disabled_device_serials;
+        dirty = true;
+    }
+
     if (!EnsureHotpatchStateMapped())
     {
         CloseHotpatchStateMapping();
@@ -2034,6 +2182,17 @@ void OverlayApp::Impl::RefreshSettings(const bool force_rescan)
         dirty = true;
     }
 
+    if (hotpatch_snapshot.pose_updates_disabled != state.hotpatch_pose_updates_disabled)
+    {
+        state.hotpatch_pose_updates_disabled = hotpatch_snapshot.pose_updates_disabled;
+        dirty = true;
+    }
+
+    if (RefreshTrackedDeviceList())
+    {
+        dirty = true;
+    }
+
     if (force_rescan || dirty)
     {
         RescanSessionFiles();
@@ -2091,6 +2250,92 @@ void OverlayApp::Impl::RescanSessionFiles()
     }
 }
 
+bool OverlayApp::Impl::RefreshTrackedDeviceList()
+{
+    if (vr::VRSystem() == nullptr)
+    {
+        if (!state.tracked_devices.empty())
+        {
+            state.tracked_devices.clear();
+            state.device_list_scroll_index = 0;
+            return true;
+        }
+        return false;
+    }
+
+    std::vector<DeviceControlItem> devices;
+    for (vr::TrackedDeviceIndex_t index = 0; index < vr::k_unMaxTrackedDeviceCount; ++index)
+    {
+        const vr::ETrackedDeviceClass device_class = vr::VRSystem()->GetTrackedDeviceClass(index);
+        if (!IsUiSuppressibleDeviceClass(device_class))
+        {
+            continue;
+        }
+
+        const std::string serial = GetTrackedDeviceString(vr::VRSystem(), index, vr::Prop_SerialNumber_String);
+        if (serial.empty() || IsProjectVirtualDeviceSerial(serial))
+        {
+            continue;
+        }
+
+        DeviceControlItem item;
+        item.device_index = index;
+        item.device_class = static_cast<std::int32_t>(device_class);
+        item.serial = serial;
+        item.model_number = GetTrackedDeviceString(vr::VRSystem(), index, vr::Prop_ModelNumber_String);
+        item.manufacturer_name = GetTrackedDeviceString(vr::VRSystem(), index, vr::Prop_ManufacturerName_String);
+        item.controller_type = GetTrackedDeviceString(vr::VRSystem(), index, vr::Prop_ControllerType_String);
+        item.tracking_system = GetTrackedDeviceString(vr::VRSystem(), index, vr::Prop_TrackingSystemName_String);
+        item.disabled = ContainsSerial(state.disabled_device_serials, serial);
+        devices.push_back(std::move(item));
+    }
+
+    for (const std::string& disabled_serial : state.disabled_device_serials)
+    {
+        if (!disabled_serial.empty() &&
+            std::find_if(devices.begin(), devices.end(), [&](const DeviceControlItem& item)
+            {
+                return _stricmp(item.serial.c_str(), disabled_serial.c_str()) == 0;
+            }) == devices.end())
+        {
+            DeviceControlItem item;
+            item.serial = disabled_serial;
+            item.model_number = "Not currently visible";
+            item.disabled = true;
+            devices.push_back(std::move(item));
+        }
+    }
+
+    std::sort(devices.begin(), devices.end(), [](const DeviceControlItem& left, const DeviceControlItem& right)
+    {
+        if (left.device_class != right.device_class)
+        {
+            return left.device_class < right.device_class;
+        }
+        return _stricmp(left.serial.c_str(), right.serial.c_str()) < 0;
+    });
+
+    const bool changed = devices.size() != state.tracked_devices.size() ||
+        !std::equal(devices.begin(), devices.end(), state.tracked_devices.begin(), [](const auto& left, const auto& right)
+        {
+            return left.device_index == right.device_index &&
+                left.device_class == right.device_class &&
+                left.serial == right.serial &&
+                left.model_number == right.model_number &&
+                left.manufacturer_name == right.manufacturer_name &&
+                left.controller_type == right.controller_type &&
+                left.tracking_system == right.tracking_system &&
+                left.disabled == right.disabled;
+        });
+
+    state.tracked_devices = std::move(devices);
+    const std::size_t max_scroll = state.tracked_devices.size() > kDeviceListVisibleRows
+        ? state.tracked_devices.size() - kDeviceListVisibleRows
+        : 0u;
+    state.device_list_scroll_index = std::min(state.device_list_scroll_index, max_scroll);
+    return changed;
+}
+
 void OverlayApp::Impl::PumpGlobalEvents()
 {
     if (vr::VRSystem() == nullptr)
@@ -2144,6 +2389,14 @@ void OverlayApp::Impl::PumpOverlayEvents(const vr::VROverlayHandle_t overlay_han
                 const LONG x = static_cast<LONG>(std::lround(event.data.mouse.x));
                 const LONG y = static_cast<LONG>(kMainHeight - 1 - std::lround(event.data.mouse.y));
                 HandleMouseButtonUp(x, y);
+            }
+            break;
+
+        case vr::VREvent_ScrollDiscrete:
+        case vr::VREvent_ScrollSmooth:
+            if (overlay_handle == state.main_overlay && std::fabs(event.data.scroll.ydelta) > 0.001f)
+            {
+                ScrollDeviceList(event.data.scroll.ydelta > 0.0f ? -1 : 1);
             }
             break;
 
@@ -2213,6 +2466,55 @@ void OverlayApp::Impl::HandleDesktopWindowClick(const LONG x, const LONG y)
         HandleButtonAction(button, true);
         return;
     }
+}
+
+void OverlayApp::Impl::ScrollDeviceList(const int delta_rows)
+{
+    if (delta_rows == 0 || state.tracked_devices.size() <= kDeviceListVisibleRows)
+    {
+        return;
+    }
+
+    const std::size_t max_scroll = state.tracked_devices.size() - kDeviceListVisibleRows;
+    const int current = static_cast<int>(state.device_list_scroll_index);
+    const int next = std::clamp(current + delta_rows, 0, static_cast<int>(max_scroll));
+    if (next == current)
+    {
+        return;
+    }
+
+    state.device_list_scroll_index = static_cast<std::size_t>(next);
+    state.dirty = true;
+}
+
+void OverlayApp::Impl::WriteDisabledDeviceSerials()
+{
+    if (state.disabled_device_serials.size() > hotpatch::kMaxDisabledDeviceSerials)
+    {
+        state.disabled_device_serials.resize(hotpatch::kMaxDisabledDeviceSerials);
+    }
+
+    WriteSettingsString(
+        replay_settings::kHotpatchSection,
+        replay_settings::kDisabledDeviceSerialsKey,
+        JoinSerialListSetting(state.disabled_device_serials));
+    if (!state.disabled_device_serials.empty())
+    {
+        WriteSettingsBool(replay_settings::kDriverSection, replay_settings::kEnableKey, true);
+    }
+
+    std::string broker_error;
+    if (!EnsureBrokerRunning(state.exe_path.parent_path(), &broker_error))
+    {
+        state.last_error = broker_error;
+    }
+    else
+    {
+        state.last_error.clear();
+    }
+
+    RefreshTrackedDeviceList();
+    state.dirty = true;
 }
 
 void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_desktop)
@@ -2365,6 +2667,51 @@ void OverlayApp::Impl::HandleButtonAction(const Button& button, const bool from_
         if (button.file_index < state.session_files.size())
         {
             TriggerLoad(state.session_files[button.file_index]);
+        }
+        return;
+
+    case ButtonAction::DeviceScrollUp:
+        ScrollDeviceList(-1);
+        return;
+
+    case ButtonAction::DeviceScrollDown:
+        ScrollDeviceList(1);
+        return;
+
+    case ButtonAction::ToggleDeviceDisabled:
+        if (button.file_index < state.tracked_devices.size())
+        {
+            const std::string serial = state.tracked_devices[button.file_index].serial;
+            auto existing = std::find_if(
+                state.disabled_device_serials.begin(),
+                state.disabled_device_serials.end(),
+                [&](const std::string& candidate) { return _stricmp(candidate.c_str(), serial.c_str()) == 0; });
+            if (existing != state.disabled_device_serials.end())
+            {
+                state.disabled_device_serials.erase(existing);
+                state.status_text = "Enabled device " + serial;
+            }
+            else if (state.disabled_device_serials.size() < hotpatch::kMaxDisabledDeviceSerials)
+            {
+                state.disabled_device_serials.push_back(serial);
+                state.status_text = "Disabled device " + serial;
+            }
+            else
+            {
+                state.last_error = "Disabled device list is full.";
+                state.dirty = true;
+                return;
+            }
+            WriteDisabledDeviceSerials();
+        }
+        return;
+
+    case ButtonAction::ClearDisabledDevices:
+        if (!state.disabled_device_serials.empty())
+        {
+            state.disabled_device_serials.clear();
+            state.status_text = "Cleared all disabled devices.";
+            WriteDisabledDeviceSerials();
         }
         return;
 
@@ -2806,9 +3153,9 @@ void OverlayApp::Impl::RenderMainOverlay()
     draw_runtime_line(L"Runtime: " + Utf8ToWide(state.hotpatch_dll_status), RGB(172, 187, 205));
     draw_runtime_line(
         L"Pose updates: " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_seen)) +
+            L" / disabled " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_disabled)) +
             L" / suppressed " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_suppressed)) +
-            L" / replaced " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_replaced)) +
-            L" / add calls " + Utf8ToWide(std::to_string(state.hotpatch_tracked_device_add_calls)),
+            L" / replaced " + Utf8ToWide(std::to_string(state.hotpatch_pose_updates_replaced)),
         RGB(172, 187, 205));
     draw_runtime_line(
         L"PIDs: target " + Utf8ToWide(std::to_string(state.hotpatch_target_pid)) +
@@ -2822,23 +3169,32 @@ void OverlayApp::Impl::RenderMainOverlay()
         state.last_error.empty() ? RGB(172, 187, 205) : RGB(236, 107, 102));
 
     state.main_canvas.DrawBody(L"Sessions", RECT{40, 548, 220, 580}, RGB(239, 244, 248));
+    state.main_canvas.DrawBody(L"Device Disable", RECT{1040, 548, 1260, 580}, RGB(239, 244, 248));
+    AddButton(RECT{1268, 544, 1324, 584}, ButtonAction::DeviceScrollUp, 0, L"Up");
+    AddButton(RECT{1334, 544, 1390, 584}, ButtonAction::DeviceScrollDown, 0, L"Down");
+    AddButton(
+        RECT{1400, 544, 1560, 584},
+        ButtonAction::ClearDisabledDevices,
+        0,
+        L"\u53d6\u6d88\u7981\u7528\u5168\u90e8");
 
     const std::size_t page_count = std::max<std::size_t>(1, (state.session_files.size() + kPageSize - 1) / kPageSize);
     const std::size_t start_index = state.page_index * kPageSize;
     const std::size_t end_index = std::min(state.session_files.size(), start_index + kPageSize);
+    const RECT session_panel{40, 596, 1010, 900};
+    const RECT device_panel{1040, 596, 1560, 900};
 
     if (state.session_files.empty())
     {
-        const RECT empty_panel{40, 596, 1560, 900};
-        state.main_canvas.FillRectColor(empty_panel, RGB(26, 31, 43));
-        state.main_canvas.FrameRectColor(empty_panel, RGB(73, 88, 109), 2);
+        state.main_canvas.FillRectColor(session_panel, RGB(26, 31, 43));
+        state.main_canvas.FrameRectColor(session_panel, RGB(73, 88, 109), 2);
         state.main_canvas.DrawBody(
             L"No .svrcap files were found under the configured session root.",
-            RECT{90, 660, 1510, 696},
+            RECT{70, 660, 980, 696},
             RGB(239, 244, 248));
         state.main_canvas.DrawSmall(
-            L"Use Set Session Root to point at your sessions directory, paste a copied Explorer path, or enter a full file path.",
-            RECT{90, 700, 1510, 764},
+            L"Use Set Session Root, Paste Clipboard, or Direct Path.",
+            RECT{70, 700, 980, 764},
             RGB(172, 187, 205),
             DT_LEFT | DT_TOP | DT_WORDBREAK);
     }
@@ -2852,7 +3208,7 @@ void OverlayApp::Impl::RenderMainOverlay()
             const bool is_requested = !requested_key.empty() && file_key == requested_key;
             const bool is_loaded = !loaded_key.empty() && file_key == loaded_key;
 
-            RECT row_rect{40, row_top, 1560, row_top + 66};
+            RECT row_rect{40, row_top, 1010, row_top + 52};
             COLORREF row_fill = RGB(31, 39, 52);
             COLORREF row_frame = RGB(73, 88, 109);
 
@@ -2871,12 +3227,12 @@ void OverlayApp::Impl::RenderMainOverlay()
             state.main_canvas.FrameRectColor(row_rect, row_frame, 2);
 
             state.main_canvas.DrawBody(
-                TruncateMiddle(FilenameLabel(session_path), 56),
-                RECT{60, row_top + 8, 1180, row_top + 34},
+                TruncateMiddle(FilenameLabel(session_path), 42),
+                RECT{60, row_top + 6, 700, row_top + 30},
                 RGB(244, 247, 250));
             state.main_canvas.DrawSmall(
-                TruncateMiddle(Utf8ToWide(PathToUtf8(session_path)), 118),
-                RECT{60, row_top + 34, 1180, row_top + 58},
+                TruncateMiddle(Utf8ToWide(PathToUtf8(session_path)), 78),
+                RECT{60, row_top + 28, 820, row_top + 48},
                 RGB(172, 187, 205));
 
             std::wstring status_tag;
@@ -2890,11 +3246,77 @@ void OverlayApp::Impl::RenderMainOverlay()
             }
             if (!status_tag.empty())
             {
-                state.main_canvas.DrawSmall(status_tag, RECT{1185, row_top + 18, 1310, row_top + 46}, row_frame);
+                state.main_canvas.DrawSmall(status_tag, RECT{725, row_top + 16, 850, row_top + 42}, row_frame);
             }
 
-            AddButton(RECT{1320, row_top + 12, 1510, row_top + 54}, ButtonAction::LoadFile, file_index, L"Load");
-            row_top += 72;
+            AddButton(RECT{865, row_top + 9, 990, row_top + 43}, ButtonAction::LoadFile, file_index, L"Load");
+            row_top += 60;
+        }
+    }
+
+    state.main_canvas.FillRectColor(device_panel, RGB(26, 31, 43));
+    state.main_canvas.FrameRectColor(device_panel, RGB(73, 88, 109), 2);
+    state.main_canvas.DrawSmall(
+        L"Disabled " + Utf8ToWide(std::to_string(state.disabled_device_serials.size())) +
+            L" / listed " + Utf8ToWide(std::to_string(state.tracked_devices.size())) +
+            L". Scroll to find PICO hand/controller devices.",
+        RECT{1060, 604, 1540, 628},
+        RGB(140, 154, 173));
+
+    if (state.tracked_devices.empty())
+    {
+        state.main_canvas.DrawBody(
+            L"No controller or tracker devices are visible to OpenVR.",
+            RECT{1060, 660, 1540, 696},
+            RGB(239, 244, 248));
+        state.main_canvas.DrawSmall(
+            L"Power on the devices, then press Refresh. HMD devices are intentionally excluded from this list.",
+            RECT{1060, 700, 1540, 764},
+            RGB(172, 187, 205),
+            DT_LEFT | DT_TOP | DT_WORDBREAK);
+    }
+    else
+    {
+        const std::size_t first_device = state.device_list_scroll_index;
+        const std::size_t last_device = std::min(
+            state.tracked_devices.size(),
+            first_device + static_cast<std::size_t>(kDeviceListVisibleRows));
+        int row_top = 636;
+        for (std::size_t device_index = first_device; device_index < last_device; ++device_index)
+        {
+            const DeviceControlItem& device = state.tracked_devices[device_index];
+            const RECT row_rect{1060, row_top, 1540, row_top + 46};
+            const COLORREF row_fill = device.disabled ? RGB(83, 43, 45) : RGB(31, 39, 52);
+            const COLORREF row_frame = device.disabled ? RGB(236, 107, 102) : RGB(73, 88, 109);
+            state.main_canvas.FillRectColor(row_rect, row_fill);
+            state.main_canvas.FrameRectColor(row_rect, row_frame, 2);
+
+            std::string primary = !device.model_number.empty() ? device.model_number : device.serial;
+            if (!device.controller_type.empty())
+            {
+                primary += " / " + device.controller_type;
+            }
+
+            std::string detail = WideToUtf8(DeviceClassLabel(device.device_class)) + " / " + device.serial;
+            if (!device.tracking_system.empty())
+            {
+                detail += " / " + device.tracking_system;
+            }
+
+            state.main_canvas.DrawBody(
+                TruncateMiddle(Utf8ToWide(primary), 36),
+                RECT{1076, row_top + 4, 1398, row_top + 24},
+                RGB(244, 247, 250));
+            state.main_canvas.DrawSmall(
+                TruncateMiddle(Utf8ToWide(detail), 48),
+                RECT{1076, row_top + 24, 1398, row_top + 42},
+                RGB(172, 187, 205));
+            AddButton(
+                RECT{1406, row_top + 8, 1530, row_top + 38},
+                ButtonAction::ToggleDeviceDisabled,
+                device_index,
+                device.disabled ? L"[x] Disabled" : L"[ ] Enabled");
+            row_top += 52;
         }
     }
 
@@ -2902,7 +3324,7 @@ void OverlayApp::Impl::RenderMainOverlay()
         Utf8ToWide(
             "Found " + std::to_string(state.session_files.size()) + " session file(s). Page " +
             std::to_string(state.page_index + 1) + "/" + std::to_string(page_count) +
-            ". Load keeps the session stopped at frame 0. Use Play to start. Record Mode switches between driver-pose capture for replay/hotpatch work and calibrated standing-pose capture for Unity playback after Space Calibrator alignment. Start Recording writes a timestamped .svrcap in the current session directory, or next to the current direct-path session if one is selected, while skipping this tool's own replay devices. Record interval defaults to 10 ms for SteamVR Tracking 2.0 and can be changed here; desktop clicks cycle presets while the VR button opens a numeric keyboard. Hotpatch status is read directly from the shared-memory control block, not by polling broker --status. Live Mode cycles through Suppress, Replace, and Passthrough with no SteamVR restart once the broker is active. Paste Clipboard accepts Explorer-copied files or folders. The desktop mirror also supports Ctrl+V and drag-drop."),
+            ". Load keeps the session stopped at frame 0. Device Disable is independent of replay: checked devices are forced disconnected by the hotpatch path until cleared. Record Mode switches between broker driver-pose capture and external calibrated standing-pose recording. Hotpatch status is read from shared memory, not broker --status polling. Paste Clipboard accepts Explorer-copied files or folders; the desktop mirror supports Ctrl+V, drag-drop, and mouse wheel scrolling over the device list."),
         RECT{40, 930, 1560, 972},
         RGB(140, 154, 173),
         DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -3029,6 +3451,22 @@ void OverlayApp::Impl::AddButton(
         frame = RGB(133, 187, 237);
         break;
 
+    case ButtonAction::ToggleDeviceDisabled:
+        fill = RGB(74, 48, 55);
+        frame = RGB(236, 107, 102);
+        break;
+
+    case ButtonAction::ClearDisabledDevices:
+        fill = RGB(57, 58, 64);
+        frame = RGB(218, 186, 97);
+        break;
+
+    case ButtonAction::DeviceScrollUp:
+    case ButtonAction::DeviceScrollDown:
+        fill = RGB(48, 68, 97);
+        frame = RGB(133, 187, 237);
+        break;
+
     case ButtonAction::ReloadCurrent:
         fill = RGB(102, 75, 34);
         frame = RGB(218, 186, 97);
@@ -3103,6 +3541,25 @@ LRESULT OverlayApp::Impl::HandleDesktopWindowMessage(
         SetFocus(hwnd);
         HandleDesktopWindowClick(GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam));
         return 0;
+
+    case WM_MOUSEWHEEL:
+    {
+        POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        ScreenToClient(hwnd, &point);
+
+        RECT client_rect{};
+        GetClientRect(hwnd, &client_rect);
+        const LONG client_width = std::max<LONG>(1, client_rect.right - client_rect.left);
+        const LONG client_height = std::max<LONG>(1, client_rect.bottom - client_rect.top);
+        const LONG scaled_x = std::clamp<LONG>((point.x * kMainWidth) / client_width, 0, kMainWidth - 1);
+        const LONG scaled_y = std::clamp<LONG>((point.y * kMainHeight) / client_height, 0, kMainHeight - 1);
+        if (scaled_x >= 1040 && scaled_y >= 548 && scaled_y <= 900)
+        {
+            ScrollDeviceList(GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? -1 : 1);
+            return 0;
+        }
+        break;
+    }
 
     case WM_KEYDOWN:
         if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && (wparam == 'V' || wparam == 'v'))

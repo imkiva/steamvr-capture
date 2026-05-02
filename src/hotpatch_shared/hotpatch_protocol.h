@@ -6,9 +6,10 @@
 namespace steamvr_capture::hotpatch
 {
 constexpr std::uint32_t kProtocolMagic = 0x53564348u;
-constexpr std::uint32_t kProtocolVersion = 3u;
-constexpr wchar_t kSharedStateMappingName[] = L"Local\\SteamVRCaptureHotpatchStateV3";
+constexpr std::uint32_t kProtocolVersion = 4u;
+constexpr wchar_t kSharedStateMappingName[] = L"Local\\SteamVRCaptureHotpatchStateV4";
 constexpr std::size_t kMaxTrackedSerials = 32u;
+constexpr std::size_t kMaxDisabledDeviceSerials = 64u;
 constexpr std::size_t kMaxObservedDevices = 32u;
 constexpr std::size_t kMaxWidePathCharacters = 260u;
 constexpr std::size_t kMaxWideStatusCharacters = 256u;
@@ -83,9 +84,11 @@ struct SharedState
     std::uint32_t pose_updates_seen = 0u;
     std::uint32_t pose_updates_suppressed = 0u;
     std::uint32_t pose_updates_replaced = 0u;
+    std::uint32_t pose_updates_disabled = 0u;
     std::uint32_t recording_active = 0u;
     std::uint32_t recording_device_count = 0u;
     std::uint32_t observed_device_count = 0u;
+    std::uint32_t disabled_serial_count = 0u;
     std::uint64_t broker_heartbeat_ms = 0u;
     std::uint64_t injected_heartbeat_ms = 0u;
     std::uint64_t playback_timestamp_ns = 0u;
@@ -97,6 +100,7 @@ struct SharedState
     wchar_t dll_status_text[kMaxWideStatusCharacters]{};
     wchar_t recording_status_text[kMaxWideStatusCharacters]{};
     TrackedSerialSlot serials[kMaxTrackedSerials]{};
+    TrackedSerialSlot disabled_serials[kMaxDisabledDeviceSerials]{};
     LivePoseSlot live_poses[kMaxTrackedSerials]{};
     ObservedDeviceSlot observed_devices[kMaxObservedDevices]{};
 };

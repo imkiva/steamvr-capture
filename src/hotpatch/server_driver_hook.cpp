@@ -352,6 +352,35 @@ bool ServerDriverHook::ResolveTargetDevice(
     return false;
 }
 
+bool ServerDriverHook::IsDeviceDisabled(const vr::TrackedDeviceIndex_t device_index)
+{
+    if (shared_state_ == nullptr || shared_state_->disabled_serial_count == 0u)
+    {
+        return false;
+    }
+
+    DeviceMetadata metadata;
+    if (!TryGetDeviceMetadata(device_index, &metadata) || metadata.serial.empty())
+    {
+        return false;
+    }
+
+    const std::wstring target_serial = Utf8ToWide(metadata.serial);
+    for (std::uint32_t serial_index = 0;
+         serial_index < shared_state_->disabled_serial_count && serial_index < kMaxDisabledDeviceSerials;
+         ++serial_index)
+    {
+        if (_wcsicmp(shared_state_->disabled_serials[serial_index].serial, target_serial.c_str()) == 0 &&
+            (shared_state_->disabled_serials[serial_index].device_class == 0u ||
+                shared_state_->disabled_serials[serial_index].device_class == static_cast<std::uint32_t>(metadata.device_class)))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void ServerDriverHook::UpdateObservedDevicePose(const vr::TrackedDeviceIndex_t device_index, const vr::DriverPose_t& pose)
 {
     if (shared_state_ == nullptr)
@@ -365,7 +394,7 @@ void ServerDriverHook::UpdateObservedDevicePose(const vr::TrackedDeviceIndex_t d
         return;
     }
 
-    if (metadata.serial.rfind("svrcap_replay_slot_", 0) == 0)
+    if (metadata.serial.rfind("svrcap_replay_slot_", 0) == 0 || metadata.serial.rfind("ktk_", 0) == 0)
     {
         return;
     }
@@ -553,6 +582,18 @@ void ServerDriverHook::HandleTrackedDevicePoseUpdated(
         return;
     }
 
+    if (IsDeviceDisabled(which_device))
+    {
+        if (shared_state_ != nullptr)
+        {
+            ++shared_state_->pose_updates_disabled;
+            ++shared_state_->pose_updates_suppressed;
+        }
+        const vr::DriverPose_t disabled_pose = BuildDisconnectedPose();
+        original_tracked_device_pose_updated_(self, which_device, disabled_pose, pose_struct_size);
+        return;
+    }
+
     LiveMode live_mode = LiveMode::Passthrough;
     std::uint32_t slot_index = 0u;
     if (ResolveTargetDevice(which_device, &live_mode, &slot_index))
@@ -667,6 +708,16 @@ vr::DriverPose_t ServerDriverHook::TrackedDeviceProxy::GetPose()
     }
     if (owner_ != nullptr)
     {
+        if (owner_->IsDeviceDisabled(object_id_))
+        {
+            if (owner_->shared_state_ != nullptr)
+            {
+                ++owner_->shared_state_->pose_updates_disabled;
+                ++owner_->shared_state_->pose_updates_suppressed;
+            }
+            return owner_->BuildDisconnectedPose();
+        }
+
         LiveMode live_mode = LiveMode::Passthrough;
         std::uint32_t slot_index = 0u;
         if (owner_->ResolveTargetDevice(object_id_, &live_mode, &slot_index))

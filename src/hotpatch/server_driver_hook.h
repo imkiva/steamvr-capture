@@ -70,6 +70,7 @@ private:
     void RemoveDevice(vr::TrackedDeviceIndex_t device_index);
     bool TryGetDeviceMetadata(vr::TrackedDeviceIndex_t device_index, DeviceMetadata* metadata);
     void UpdateObservedDevicePose(vr::TrackedDeviceIndex_t device_index, const vr::DriverPose_t& pose);
+    bool IsDeviceDisabled(vr::TrackedDeviceIndex_t device_index);
     bool ResolveTargetDevice(vr::TrackedDeviceIndex_t device_index, LiveMode* live_mode, std::uint32_t* slot_index);
     vr::DriverPose_t BuildDisconnectedPose() const;
     vr::DriverPose_t BuildReplacedPose(const LivePoseSlot& live_pose) const;

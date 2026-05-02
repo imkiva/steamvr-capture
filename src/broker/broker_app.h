@@ -75,6 +75,7 @@ private:
     hotpatch::LiveMode live_mode_ = hotpatch::LiveMode::Suppress;
     std::string playback_state_ = "stopped";
     std::string session_path_;
+    std::vector<std::wstring> disabled_device_serials_;
     session::SessionData loaded_session_;
     std::vector<std::wstring> target_serials_;
     std::vector<std::uint32_t> target_device_classes_;
